@@ -27,6 +27,7 @@ services:
       - ..:/mnt/card-sentry:ro   # consumer checkout (in-image plugin build)
       - ./jobs:/jobs             # built .so lands here for the submitter
       - ./ckpt:/ckpt             # shared checkpoint root (2PC scene)
+      - ./capture:/capture       # shared flight-recorder root (replay scene)
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/api/v1/health >/dev/null"]
       interval: 3s
@@ -61,6 +62,7 @@ services:
       - ../data:/data:ro
       - ../out-cluster:/out
       - ./ckpt:/ckpt
+      - ./capture:/capture
     depends_on:
       coordinator:
         condition: service_healthy
@@ -78,6 +80,7 @@ services:
       - ../data:/data:ro
       - ../out-cluster:/out
       - ./ckpt:/ckpt
+      - ./capture:/capture
     depends_on:
       coordinator:
         condition: service_healthy

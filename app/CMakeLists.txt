@@ -36,3 +36,8 @@ add_executable(patterns_test tests/patterns_test.cpp)
 target_include_directories(patterns_test PRIVATE src)
 target_link_libraries(patterns_test PRIVATE clink::core clink::test_support)
 add_test(NAME patterns_test COMMAND patterns_test)
+
+add_executable(schema_evolution_test tests/schema_evolution_test.cpp)
+target_include_directories(schema_evolution_test PRIVATE src)
+target_link_libraries(schema_evolution_test PRIVATE clink::core)
+add_test(NAME schema_evolution_test COMMAND schema_evolution_test)

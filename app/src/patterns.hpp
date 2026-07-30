@@ -53,12 +53,6 @@ using Match = clink::cep::PatternMatch<Event>;
 
 namespace detail {
 
-inline std::string fmt2(double v) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%.2f", v);
-    return buf;
-}
-
 inline const Event* first_of(const Match& m, const char* step) {
     const auto it = m.find(step);
     if (it == m.end() || it->second.empty()) {

@@ -65,6 +65,14 @@ inline EventType event_type_from(std::string_view s) {
 
 namespace detail {
 
+// Two-decimal fixed formatter, shared by alert detail strings and the
+// risk-profile JSON.
+inline std::string fmt2(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f", v);
+    return buf;
+}
+
 inline std::optional<std::string_view> raw_value(std::string_view line, std::string_view key) {
     // Finds `"key":` and returns the value slice up to the next ',' or '}'
     // (strings return the slice inside their quotes).
