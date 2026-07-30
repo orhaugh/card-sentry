@@ -5,6 +5,7 @@
 /out-cluster/
 /cluster/jobs/
 /cluster/ckpt/
+/cluster/capture/
 
 # The pinned clink checkout + local install prefix (scripts/get-clink.sh)
 /.clink/
