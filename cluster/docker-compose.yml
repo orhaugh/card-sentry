@@ -1,0 +1,65 @@
+# card-sentry distributed scene: one clink Coordinator and two Workers
+# running the SAME five detectors as the embedded app, packaged as a
+# compiled job plugin (.so) and shipped to every worker at submit.
+#
+# The image must be a clink-runtime built from the SAME clink commit the
+# plugin is compiled against (the ABI gate compares git SHAs). The scene
+# builds the plugin INSIDE this image - it bakes the SDK - so both sides
+# match by construction.
+#
+#   cluster/run.sh               # builds the .so in-image, submits, gates
+#   open http://localhost:8081   # coordinator dashboard while it runs
+#
+# Volumes: the tape is read-only under /data on both workers (the source
+# subtask may land on either); alert sinks write to the shared ./out-cluster
+# mount; ./cluster/jobs carries the freshly built plugin to the submitter.
+
+services:
+  coordinator:
+    image: ${CLINK_IMAGE:-clink-runtime:latest}
+    command: >
+      clink_node --role=coordinator --port=6123
+                 --bind-host=0.0.0.0 --advertise-host=coordinator
+                 --http-port=8081 --http-bind=0.0.0.0
+    ports:
+      - "8081:8081"   # dashboard + HTTP API
+    volumes:
+      - ..:/mnt/card-sentry:ro   # consumer checkout (in-image plugin build)
+      - ./jobs:/jobs             # built .so lands here for the submitter
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/api/v1/health >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  worker1:
+    image: ${CLINK_IMAGE:-clink-runtime:latest}
+    command: >
+      clink_node --role=worker --id=worker-1
+                 --coordinator-host=coordinator --coordinator-port=6123
+                 --data-host=worker1 --slots=16
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    volumes:
+      - ../data:/data:ro
+      - ../out-cluster:/out
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: on-failure
+
+  worker2:
+    image: ${CLINK_IMAGE:-clink-runtime:latest}
+    command: >
+      clink_node --role=worker --id=worker-2
+                 --coordinator-host=coordinator --coordinator-port=6123
+                 --data-host=worker2 --slots=16
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    volumes:
+      - ../data:/data:ro
+      - ../out-cluster:/out
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: on-failure

@@ -1,6 +1,8 @@
 # Generated event tape and run outputs
 /data/
 /out/
+/out-cluster/
+/cluster/jobs/
 
 # The pinned clink checkout + local install prefix (scripts/get-clink.sh)
 /.clink/

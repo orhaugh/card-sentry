@@ -25,10 +25,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default="data/manifest.json")
     ap.add_argument("--alerts", default="out/alerts.ndjson")
+    ap.add_argument("--only-patterns", default="",
+                    help="comma-separated pattern subset to gate (deployments "
+                         "that ship a subset of the detectors, e.g. the "
+                         "cluster plugin); default: every pattern")
     args = ap.parse_args()
+
+    only = {p for p in args.only_patterns.split(",") if p}
 
     with open(args.manifest) as f:
         manifest = json.load(f)
+    if only:
+        manifest["expected_alerts"] = [
+            e for e in manifest["expected_alerts"] if e["pattern"] in only]
+        manifest["campaigns"] = [
+            c for c in manifest["campaigns"] if c["pattern"] in only]
 
     actual = Counter()
     lines = 0

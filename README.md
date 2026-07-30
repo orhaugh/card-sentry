@@ -16,17 +16,17 @@ any project would - and it doubles as an integration test of the engine
 surface it exercises. Its first run found a real CEP correctness defect
 (below), which was fixed in clink before this repository's first commit.
 
-**Status: round 2.** Embedded detection over the tape, oracle-gated, with
-per-pattern harness tests; plus dynamic rules over broadcast state (a
-second stream of effective-dated watchlists joining the auths) and the
-per-card risk profile served over clink's queryable-state HTTP surface.
-The detectors currently require clink `main` (they depend on fixes newer
+**Status: round 3 in progress.** Embedded detection over the tape,
+oracle-gated, with per-pattern harness tests; dynamic rules over broadcast
+state; the per-card risk profile served over clink's queryable-state HTTP
+surface; and the five CEP detectors deployed to a real coordinator +
+two-worker cluster as a compiled job plugin, gated against the same
+oracle. The detectors require clink `main` (they depend on fixes newer
 than v0.4.0), so install with `CLINK_SOURCE` pointing at a clink checkout;
-the pin flips to the next release when it exists. Planned next: cluster
-deployment as a compiled job plugin with exactly-once alert delivery to
-Postgres (kill a worker mid-run, the case table stays exact - the 2PC
-commit path is coordinator-driven, so it belongs with the cluster scene),
-savepoint schema evolution, and incident replay with `--emit-test`.
+the pin flips to the next release when it exists. Planned next:
+exactly-once alert delivery to Postgres on the cluster (kill a worker
+mid-run, the case table stays exact), incident replay with `--emit-test`,
+and savepoint schema evolution.
 
 ## Quick start
 
@@ -118,6 +118,34 @@ expectation computed independently from the tape by Python: point lookups
 field for field, a 404 for a card that never authed, and the `/scan`
 route returning profiles - state as a table over HTTP, no export step.
 
+## The same detectors, on a cluster
+
+`app/src/card_sentry_job.cpp` packages the five CEP detectors as a
+compiled job plugin (`CLINK_REGISTER_JOB`), sharing the pattern builders
+and alert selectors in `patterns.hpp` with the embedded pipeline - the
+two deployments cannot drift. Inline CEP lambdas are in-process-only on
+the plain fluent path; packaging them as a plugin is exactly what makes
+them cluster-runnable, so the constraint becomes the demonstration.
+
+`cluster/run.sh` brings up a coordinator and two workers (compose),
+compiles the plugin INSIDE the runtime image - a job `.so` must be built
+on the workers' platform against the same clink commit, and the image
+bakes the SDK precisely so both are guaranteed - submits it with
+`clink_submit_job` (also in-image: the submitter dlopens the Linux
+`.so`), and gates `out-cluster/alerts-*.ndjson` against the manifest
+restricted to the five shipped patterns:
+
+```
+submit: name=card-sentry completed=1 ok=1
+alerts: 9 written, 9 expected
+OK: every expected alert fired, every control stayed quiet, zero false positives.
+```
+
+The OTP detector's alert channel is the fluent timed-out side output end
+to end: through the spec, the planner's chains, and the workers' network
+channels. The dashboard is live at http://localhost:8081 during the run
+(`KEEP_UP=1` leaves it up).
+
 ## Verification
 
 Three independent gates, all run by `scripts/run-detections.sh`:
@@ -158,6 +186,23 @@ showcase that doubles as an integration test:
    queryable-state scene linked; fixed in clink's export set and
    generated package config (TLS-off builds still take no OpenSSL
    dependency).
+4. **The planner could fuse a side-output consumer into a chain.** The
+   chain-extension walk matched "the unique consumer" by upstream id
+   alone, ignoring the side tag, so a side consumer declared before the
+   main consumer was fused into the chain and received the MAIN stream:
+   every healthy OTP completion landed in the never-verified alert file,
+   the real main consumer starved (job permanently incomplete, zero
+   errors), and the timeouts vanished. Found by this repo's first plugin
+   submit; fixed with the failing declaration order pinned as an
+   in-process cluster regression.
+5. **Plugin-typed side outputs failed to attach on a real cluster.**
+   Unmasked by fixing 4: the worker's chain dispatch resolved side-output
+   attachers from the process-wide default registry (built-ins only)
+   instead of the job bundle's registry where a dlopen'd plugin's types
+   land - Linux-only, since macOS unifies the singletons, and invisible
+   to any in-process test. Fixed alongside the other bundle-scoped
+   registry lookups; this repository's containerised gate is the
+   regression home for the class.
 
 ## Layout
 
@@ -165,14 +210,17 @@ showcase that doubles as an integration test:
 scripts/get-clink.sh          install clink (release tag, or CLINK_SOURCE=<checkout>)
 scripts/run-detections.sh     generate -> build -> test -> detect -> verify
 scripts/scene-risk-lookup.sh  queryable-state scene: served profiles vs the tape
+cluster/run.sh                cluster scene: in-image plugin build -> submit -> gate
+cluster/docker-compose.yml    coordinator + two workers (clink-runtime image)
 tools/csgen.py                deterministic tape + rules + manifest generator
-tools/check.py                the oracle
-app/src/events.hpp            event model, parser, codec, haversine, alerts
-app/src/patterns.hpp          the five CEP detectors
+tools/check.py                the oracle (--only-patterns for subset deployments)
+app/src/events.hpp            event model, parser, codecs, haversine, alerts
+app/src/patterns.hpp          shared pattern builders + alert selectors
 app/src/rules.hpp             effective-dated rule model + codec
 app/src/watchlist.hpp         broadcast-state watchlist detector
 app/src/risk_profile.hpp      per-card profile + queryable-state binding
 app/src/card_sentry.cpp       the embedded pipeline
+app/src/card_sentry_job.cpp   the same detectors as a job plugin (.so)
 app/tests/patterns_test.cpp   harness tests per detector
 ```
 
