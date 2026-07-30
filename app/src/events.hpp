@@ -332,4 +332,42 @@ inline std::string alert_to_json(const Alert& a) {
     return out;
 }
 
+// Codec<Alert>: needed when alerts cross process boundaries (the cluster
+// job's network channels). Same framing conventions as the Event codec.
+namespace detail {
+
+inline void encode_alert_into(const Alert& a, clink::Codec<Alert>::Bytes& out) {
+    put_str(out, a.pattern);
+    put_str(out, a.entity_kind);
+    put_i64(out, a.entity_id);
+    put_i64(out, a.ts);
+    put_str(out, a.detail);
+}
+
+}  // namespace detail
+
+inline clink::Codec<Alert> alert_codec() {
+    return clink::Codec<Alert>{
+        .encode =
+            [](const Alert& a) {
+                clink::Codec<Alert>::Bytes out;
+                detail::encode_alert_into(a, out);
+                return out;
+            },
+        .decode = [](clink::Codec<Alert>::BytesView b) -> std::optional<Alert> {
+            detail::Cursor c{b};
+            Alert a;
+            if (!c.take_str(a.pattern) || !c.take_str(a.entity_kind) ||
+                !c.take_i64(a.entity_id) || !c.take_i64(a.ts) || !c.take_str(a.detail) ||
+                c.at != b.size()) {
+                return std::nullopt;
+            }
+            return a;
+        },
+        .encode_into =
+            [](const Alert& a, clink::Codec<Alert>::Bytes& out) {
+                detail::encode_alert_into(a, out);
+            }};
+}
+
 }  // namespace cs

@@ -93,13 +93,18 @@ inline bool in_band(const Event& e) {
 
 }  // namespace detail
 
+// Each detector is split into a pattern builder plus an alert selector so
+// the embedded Dag-direct operators (make_*) and the fluent plugin job
+// (app/src/card_sentry_job.cpp) share one definition of the detection
+// logic - the two deployments must never drift.
+
 // --- card_testing -----------------------------------------------------------
 // A burst of small declined authorisations (the fraudster validating a stolen
 // number) followed by one large approved purchase. Quantified begin step plus
 // an iterative strike predicate sized against the captured probes.
-inline std::shared_ptr<CepOp> make_card_testing() {
+inline clink::cep::Pattern<Event> card_testing_pattern() {
     using clink::cep::IterativePredicate;
-    auto p = clink::cep::Pattern<Event>::begin("probe")
+    return clink::cep::Pattern<Event>::begin("probe")
                  .where([](const Event& e) {
                      return e.type == EventType::Auth && !e.approved && e.amount <= kProbeMax;
                  })
@@ -121,23 +126,26 @@ inline std::shared_ptr<CepOp> make_card_testing() {
                  }})
                  .within(std::chrono::milliseconds(kCardTestingWindow))
                  .after_match_skip(clink::cep::SkipStrategy::skip_past_last_event());
+}
 
-    auto select = [](const Match& m) -> Alert {
-        const auto* strike = detail::first_of(m, "strike");
-        const auto it = m.find("probe");
-        const std::size_t probes = it == m.end() ? 0 : it->second.size();
-        Alert a;
-        a.pattern = "card_testing";
-        a.entity_kind = "card";
-        a.entity_id = strike != nullptr ? strike->card : 0;
-        a.ts = strike != nullptr ? strike->ts : 0;
-        a.detail = std::to_string(probes) + " probes then " +
-                   detail::fmt2(strike != nullptr ? strike->amount : 0.0) + " approved";
-        return a;
-    };
+inline Alert card_testing_alert(const Match& m) {
+    const auto* strike = detail::first_of(m, "strike");
+    const auto it = m.find("probe");
+    const std::size_t probes = it == m.end() ? 0 : it->second.size();
+    Alert a;
+    a.pattern = "card_testing";
+    a.entity_kind = "card";
+    a.entity_id = strike != nullptr ? strike->card : 0;
+    a.ts = strike != nullptr ? strike->ts : 0;
+    a.detail = std::to_string(probes) + " probes then " +
+               detail::fmt2(strike != nullptr ? strike->amount : 0.0) + " approved";
+    return a;
+}
+
+inline std::shared_ptr<CepOp> make_card_testing() {
     auto op = std::make_shared<CepOp>(
-        p, event_codec(), [](const Event& e) { return e.card; },
-        std::function<Alert(const Match&)>(select), "cs_card_testing");
+        card_testing_pattern(), event_codec(), [](const Event& e) { return e.card; },
+        std::function<Alert(const Match&)>(card_testing_alert), "cs_card_testing");
     op->set_uid("cs-card-testing");
     return op;
 }
@@ -146,9 +154,9 @@ inline std::shared_ptr<CepOp> make_card_testing() {
 // Two card-present authorisations whose great-circle distance over elapsed
 // event time exceeds any plausible speed. The second step's iterative
 // predicate reads the anchor authorisation from the partial match.
-inline std::shared_ptr<CepOp> make_impossible_travel() {
+inline clink::cep::Pattern<Event> impossible_travel_pattern() {
     using clink::cep::IterativePredicate;
-    auto p = clink::cep::Pattern<Event>::begin("a")
+    return clink::cep::Pattern<Event>::begin("a")
                  .where([](const Event& e) {
                      return e.type == EventType::Auth && e.approved && e.present;
                  })
@@ -171,27 +179,29 @@ inline std::shared_ptr<CepOp> make_impossible_travel() {
                  }})
                  .within(std::chrono::milliseconds(kTravelWindow))
                  .after_match_skip(clink::cep::SkipStrategy::skip_past_last_event());
+}
 
-    auto select = [](const Match& m) -> Alert {
-        const auto* a = detail::first_of(m, "a");
-        const auto* b = detail::first_of(m, "b");
-        Alert out;
-        out.pattern = "impossible_travel";
-        out.entity_kind = "card";
-        out.entity_id = b != nullptr ? b->card : 0;
-        out.ts = b != nullptr ? b->ts : 0;
-        if (a != nullptr && b != nullptr) {
-            const double km = haversine_km(a->lat, a->lon, b->lat, b->lon);
-            const double hours =
-                static_cast<double>(std::max<std::int64_t>(b->ts - a->ts, 1)) / 3.6e6;
-            out.detail = a->country + " to " + b->country + ", " + detail::fmt2(km) + " km at " +
-                         detail::fmt2(km / hours) + " km/h";
-        }
-        return out;
-    };
+inline Alert impossible_travel_alert(const Match& m) {
+    const auto* a = detail::first_of(m, "a");
+    const auto* b = detail::first_of(m, "b");
+    Alert out;
+    out.pattern = "impossible_travel";
+    out.entity_kind = "card";
+    out.entity_id = b != nullptr ? b->card : 0;
+    out.ts = b != nullptr ? b->ts : 0;
+    if (a != nullptr && b != nullptr) {
+        const double km = haversine_km(a->lat, a->lon, b->lat, b->lon);
+        const double hours = static_cast<double>(std::max<std::int64_t>(b->ts - a->ts, 1)) / 3.6e6;
+        out.detail = a->country + " to " + b->country + ", " + detail::fmt2(km) + " km at " +
+                     detail::fmt2(km / hours) + " km/h";
+    }
+    return out;
+}
+
+inline std::shared_ptr<CepOp> make_impossible_travel() {
     auto op = std::make_shared<CepOp>(
-        p, event_codec(), [](const Event& e) { return e.card; },
-        std::function<Alert(const Match&)>(select), "cs_impossible_travel");
+        impossible_travel_pattern(), event_codec(), [](const Event& e) { return e.card; },
+        std::function<Alert(const Match&)>(impossible_travel_alert), "cs_impossible_travel");
     op->set_uid("cs-impossible-travel");
     return op;
 }
@@ -200,8 +210,8 @@ inline std::shared_ptr<CepOp> make_impossible_travel() {
 // Repeated login failures, then a password change, then a draining transfer,
 // with NO successful OTP verification anywhere between the failures and the
 // drain. Two negative (not_followed_by) zones express the absence.
-inline std::shared_ptr<CepOp> make_account_takeover() {
-    auto p = clink::cep::Pattern<Event>::begin("fails")
+inline clink::cep::Pattern<Event> account_takeover_pattern() {
+    return clink::cep::Pattern<Event>::begin("fails")
                  .where([](const Event& e) { return e.type == EventType::LoginFail; })
                  .times(3, 8)
                  .not_followed_by("verify_pre")
@@ -216,23 +226,26 @@ inline std::shared_ptr<CepOp> make_account_takeover() {
                  })
                  .within(std::chrono::milliseconds(kTakeoverWindow))
                  .after_match_skip(clink::cep::SkipStrategy::skip_past_last_event());
+}
 
-    auto select = [](const Match& m) -> Alert {
-        const auto* drain = detail::first_of(m, "drain");
-        const auto it = m.find("fails");
-        const std::size_t fails = it == m.end() ? 0 : it->second.size();
-        Alert a;
-        a.pattern = "account_takeover";
-        a.entity_kind = "account";
-        a.entity_id = drain != nullptr ? drain->account : 0;
-        a.ts = drain != nullptr ? drain->ts : 0;
-        a.detail = std::to_string(fails) + " failed logins, password change, then " +
-                   detail::fmt2(drain != nullptr ? drain->amount : 0.0) + " out, no OTP";
-        return a;
-    };
+inline Alert account_takeover_alert(const Match& m) {
+    const auto* drain = detail::first_of(m, "drain");
+    const auto it = m.find("fails");
+    const std::size_t fails = it == m.end() ? 0 : it->second.size();
+    Alert a;
+    a.pattern = "account_takeover";
+    a.entity_kind = "account";
+    a.entity_id = drain != nullptr ? drain->account : 0;
+    a.ts = drain != nullptr ? drain->ts : 0;
+    a.detail = std::to_string(fails) + " failed logins, password change, then " +
+               detail::fmt2(drain != nullptr ? drain->amount : 0.0) + " out, no OTP";
+    return a;
+}
+
+inline std::shared_ptr<CepOp> make_account_takeover() {
     auto op = std::make_shared<CepOp>(
-        p, event_codec(), [](const Event& e) { return e.account; },
-        std::function<Alert(const Match&)>(select), "cs_account_takeover");
+        account_takeover_pattern(), event_codec(), [](const Event& e) { return e.account; },
+        std::function<Alert(const Match&)>(account_takeover_alert), "cs_account_takeover");
     op->set_uid("cs-account-takeover");
     return op;
 }
@@ -246,42 +259,45 @@ inline clink::OutputTag<Alert> otp_timed_out_tag() {
     return clink::OutputTag<Alert>("otp_timed_out");
 }
 
+inline clink::cep::Pattern<Event> otp_pattern() {
+    return clink::cep::Pattern<Event>::begin("req")
+        .where([](const Event& e) { return e.type == EventType::OtpRequest; })
+        .followed_by("ok")
+        .where([](const Event& e) { return e.type == EventType::OtpVerify; })
+        .within(std::chrono::milliseconds(kOtpWindow));
+}
+
+inline Alert otp_healthy_alert(const Match& m) {
+    // Completed = verified in time. The pipelines drop or divert these; the
+    // value exists only because a select function must produce one.
+    const auto* req = detail::first_of(m, "req");
+    Alert a;
+    a.pattern = "otp_verified_ok";
+    a.entity_kind = "account";
+    a.entity_id = req != nullptr ? req->account : 0;
+    a.ts = req != nullptr ? req->ts : 0;
+    return a;
+}
+
+inline Alert otp_timed_out_alert(const Match& m) {
+    const auto* req = detail::first_of(m, "req");
+    Alert a;
+    a.pattern = "otp_never_verified";
+    a.entity_kind = "account";
+    a.entity_id = req != nullptr ? req->account : 0;
+    a.ts = req != nullptr ? req->ts : 0;
+    a.detail = "otp requested, never verified within " + std::to_string(kOtpWindow.count()) +
+               " min";
+    return a;
+}
+
 inline std::shared_ptr<CepOp> make_otp_never_verified() {
-    auto p = clink::cep::Pattern<Event>::begin("req")
-                 .where([](const Event& e) { return e.type == EventType::OtpRequest; })
-                 .followed_by("ok")
-                 .where([](const Event& e) { return e.type == EventType::OtpVerify; })
-                 .within(std::chrono::milliseconds(kOtpWindow));
-
-    auto healthy = [](const Match& m) -> Alert {
-        // Completed = verified in time. The pipeline drops these; the value
-        // exists only because a select function must produce one.
-        const auto* req = detail::first_of(m, "req");
-        Alert a;
-        a.pattern = "otp_verified_ok";
-        a.entity_kind = "account";
-        a.entity_id = req != nullptr ? req->account : 0;
-        a.ts = req != nullptr ? req->ts : 0;
-        return a;
-    };
     auto op = std::make_shared<CepOp>(
-        p, event_codec(), [](const Event& e) { return e.account; },
-        std::function<Alert(const Match&)>(healthy), "cs_otp_never_verified");
+        otp_pattern(), event_codec(), [](const Event& e) { return e.account; },
+        std::function<Alert(const Match&)>(otp_healthy_alert), "cs_otp_never_verified");
     op->set_uid("cs-otp-never-verified");
-
-    auto timed_out = [](const Match& m) -> Alert {
-        const auto* req = detail::first_of(m, "req");
-        Alert a;
-        a.pattern = "otp_never_verified";
-        a.entity_kind = "account";
-        a.entity_id = req != nullptr ? req->account : 0;
-        a.ts = req != nullptr ? req->ts : 0;
-        a.detail = "otp requested, never verified within " +
-                   std::to_string(kOtpWindow.count()) + " min";
-        return a;
-    };
     op->with_timed_out_output<Alert>(otp_timed_out_tag(),
-                                     std::function<Alert(const Match&)>(timed_out));
+                                     std::function<Alert(const Match&)>(otp_timed_out_alert));
     return op;
 }
 
@@ -290,9 +306,9 @@ inline std::shared_ptr<CepOp> make_otp_never_verified() {
 // total crosses the trip threshold. The quantified step captures while the
 // running total stays below the threshold; the complementary tip step takes
 // exactly the transfer that crosses it.
-inline std::shared_ptr<CepOp> make_structuring() {
+inline clink::cep::Pattern<Event> structuring_pattern() {
     using clink::cep::IterativePredicate;
-    auto p = clink::cep::Pattern<Event>::begin("t")
+    return clink::cep::Pattern<Event>::begin("t")
                  .where(IterativePredicate<Event>{[](const Event& e, const Match& m) {
                      return detail::in_band(e) && detail::band_total(m) + e.amount < kStructTotal;
                  }})
@@ -303,24 +319,27 @@ inline std::shared_ptr<CepOp> make_structuring() {
                  }})
                  .within(std::chrono::milliseconds(kStructWindow))
                  .after_match_skip(clink::cep::SkipStrategy::skip_past_last_event());
+}
 
-    auto select = [](const Match& m) -> Alert {
-        const auto* tip = detail::first_of(m, "tip");
-        const auto it = m.find("t");
-        const std::size_t below = it == m.end() ? 0 : it->second.size();
-        const double total = detail::band_total(m) + (tip != nullptr ? tip->amount : 0.0);
-        Alert a;
-        a.pattern = "structuring";
-        a.entity_kind = "account";
-        a.entity_id = tip != nullptr ? tip->account : 0;
-        a.ts = tip != nullptr ? tip->ts : 0;
-        a.detail = std::to_string(below + 1) + " sub-threshold transfers totalling " +
-                   detail::fmt2(total);
-        return a;
-    };
+inline Alert structuring_alert(const Match& m) {
+    const auto* tip = detail::first_of(m, "tip");
+    const auto it = m.find("t");
+    const std::size_t below = it == m.end() ? 0 : it->second.size();
+    const double total = detail::band_total(m) + (tip != nullptr ? tip->amount : 0.0);
+    Alert a;
+    a.pattern = "structuring";
+    a.entity_kind = "account";
+    a.entity_id = tip != nullptr ? tip->account : 0;
+    a.ts = tip != nullptr ? tip->ts : 0;
+    a.detail = std::to_string(below + 1) + " sub-threshold transfers totalling " +
+               detail::fmt2(total);
+    return a;
+}
+
+inline std::shared_ptr<CepOp> make_structuring() {
     auto op = std::make_shared<CepOp>(
-        p, event_codec(), [](const Event& e) { return e.account; },
-        std::function<Alert(const Match&)>(select), "cs_structuring");
+        structuring_pattern(), event_codec(), [](const Event& e) { return e.account; },
+        std::function<Alert(const Match&)>(structuring_alert), "cs_structuring");
     op->set_uid("cs-structuring");
     return op;
 }
