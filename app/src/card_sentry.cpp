@@ -1,13 +1,19 @@
-// card-sentry - five CEP fraud detectors over one event tape, in one
-// embedded clink pipeline:
+// card-sentry - five CEP fraud detectors plus a dynamic-rules detector
+// over one event tape, in one embedded clink pipeline:
 //
 //   FileSource -> FlatMap(parse) -> WatermarkAssigner
-//     -> fork(5)  (broadcast tee: every branch sees every event + watermark)
+//     -> fork(6)  (broadcast tee: every branch sees every event + watermark)
 //         -> filter -> CepOperator(card_testing)      \
 //         -> filter -> CepOperator(impossible_travel)  |
 //         -> filter -> CepOperator(account_takeover)   | union -> render
 //         -> filter -> CepOperator(otp_never_verified) |   -> FileSink
-//         -> filter -> CepOperator(structuring)       /
+//         -> filter -> CepOperator(structuring)        |
+//         -> filter -> broadcast_process(watchlist) <- + <- rules FileSource
+//
+// The watchlist detector joins the auth branch with a SECOND stream of
+// effective-dated merchant rules through broadcast state (see
+// watchlist.hpp for why its output is deterministic despite the two
+// streams racing).
 //
 // The OTP detector is wired inside-out relative to the others: its pattern
 // describes the healthy request-then-verify flow, its completed matches are
@@ -44,6 +50,8 @@
 
 #include "events.hpp"
 #include "patterns.hpp"
+#include "rules.hpp"
+#include "watchlist.hpp"
 
 namespace {
 
@@ -80,10 +88,12 @@ int main(int argc, char** argv) {
     using namespace clink;
 
     const std::string in = arg_or(argc, argv, "in", "data/events.ndjson");
+    const std::string rules_in = arg_or(argc, argv, "rules", "data/rules.ndjson");
     const std::string out = arg_or(argc, argv, "out", "out/alerts.ndjson");
 
-    if (!std::filesystem::exists(in)) {
-        std::cerr << "input not found: " << in << " (run tools/csgen.py first)\n";
+    if (!std::filesystem::exists(in) || !std::filesystem::exists(rules_in)) {
+        std::cerr << "input not found: " << in << " / " << rules_in
+                  << " (run tools/csgen.py first)\n";
         return 2;
     }
     std::filesystem::create_directories(std::filesystem::path(out).parent_path());
@@ -110,7 +120,7 @@ int main(int argc, char** argv) {
     auto h_parsed = dag.add_operator<std::string, cs::Event>(h_src, parse);
     auto h_timed = dag.add_operator<cs::Event, cs::Event>(h_parsed, assigner);
 
-    auto branches = dag.fork<cs::Event>(h_timed, 5);
+    auto branches = dag.fork<cs::Event>(h_timed, 6);
 
     std::vector<StageHandle<cs::Alert>> alert_streams;
 
@@ -153,6 +163,33 @@ int main(int argc, char** argv) {
             branches[4], keep_types({cs::EventType::Transfer}));
         alert_streams.push_back(
             dag.add_operator<cs::Event, cs::Alert>(h, cs::make_structuring()));
+    }
+    // watchlist: auths joined with the effective-dated rules stream via
+    // broadcast state. The stable slot/operator name pins the state
+    // identity (broadcast_process has no uid hook; the name serves).
+    {
+        auto rules_source =
+            std::make_shared<FileSource<std::string>>(rules_in, string_text_format(), 64);
+        auto parse_rules = std::make_shared<FlatMapOperator<std::string, cs::Rule>>(
+            [](const std::string& line) {
+                std::vector<cs::Rule> one;
+                if (auto r = cs::parse_rule(line)) {
+                    one.push_back(std::move(*r));
+                }
+                return one;
+            });
+        auto h_rules_raw = dag.add_source<std::string>(rules_source);
+        auto h_rules = dag.add_operator<std::string, cs::Rule>(h_rules_raw, parse_rules);
+
+        auto h_auths = dag.add_operator<cs::Event, cs::Event>(
+            branches[5], keep_types({cs::EventType::Auth}));
+
+        auto fn = std::make_shared<cs::WatchlistFn>();
+        auto [pb, pm] =
+            clink::detail::build_broadcast_process_callbacks<cs::Event, cs::Rule, cs::Alert,
+                                                             cs::RuleSet>(fn);
+        alert_streams.push_back(dag.broadcast_process<cs::Event, cs::Rule, cs::Alert, cs::RuleSet>(
+            h_auths, h_rules, pb, pm, cs::rule_set_codec(), "cs_watchlist_rules", "watchlist"));
     }
 
     auto h_alerts = dag.union_streams<cs::Alert>(alert_streams);

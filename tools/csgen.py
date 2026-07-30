@@ -18,6 +18,14 @@ Fraud campaigns are injected on dedicated entities (cards 9xxx, accounts
 detector must raise. Negative controls - sequences that look close to
 fraud but must NOT alert - are recorded with expect "none".
 
+A second file, data/rules.ndjson, carries the dynamic watchlist rules the
+broadcast-state detector consumes: merchant watchlists and per-merchant
+amount caps, each EFFECTIVE-DATED via `activate_at` (event time). Alert
+outcomes therefore depend only on event times, never on the race between
+the rules stream and the event stream; the file ends with an end_of_rules
+marker that seals the rule set (the detector buffers events until then).
+Rule campaigns use dedicated merchants that never appear in noise.
+
 Noise invariants (what makes the oracle exact):
 
   * noise cards never emit 3+ sub-2.00 declined auths in any 10-minute
@@ -87,6 +95,9 @@ MERCHANTS = [
 ]
 
 SINGAPORE = ("Singapore", 1.3521, 103.8198, "SG")
+
+# Merchants reserved for the dynamic-rules campaigns; never used by noise.
+RULE_MERCHANTS = ["grey-imports", "night-bazaar", "grand-casino", "pop-up-vintage"]
 
 
 def event(ts, etype, *, card=0, account=0, amount=0.0, approved=0,
@@ -321,6 +332,30 @@ def c_structuring(rng, tape, account_id, start, amounts, gap_h=(2, 5),
             "detail": f"band transfers {amounts}"}
 
 
+def c_rule_merchant(rng, tape, rules, card_id, merchant, kind, activate_at,
+                    auth_times_amounts, cap=0.0):
+    """A dynamic-rule campaign: one effective-dated rule plus a card's auths
+    at that merchant. Expected alerts follow from event times (and the cap)
+    alone, so the stream race is irrelevant."""
+    rules.append({"kind": kind, "merchant": merchant,
+                  "activate_at": int(activate_at), "cap": round(cap, 2)})
+    city = rng.choice(CITIES)
+    pattern = ("watchlist_hit" if kind == "merchant_watchlist"
+               else "cap_exceeded")
+    hits = 0
+    for t, amount in auth_times_amounts:
+        lat, lon, country = jitter_pos(rng, city)
+        tape.add(event(t, "auth", card=card_id, amount=amount, approved=1,
+                       present=1, lat=lat, lon=lon, merchant=merchant,
+                       country=country))
+        if t >= activate_at and (kind == "merchant_watchlist" or amount > cap):
+            hits += 1
+    return {"pattern": pattern, "entity_kind": "card", "entity_id": card_id,
+            "expect": "alert" if hits else "none", "alerts": hits,
+            "detail": f"{merchant} {kind} from t+{activate_at - BASE_TS} ms, "
+                      f"{len(auth_times_amounts)} auths, {hits} expected"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=7)
@@ -340,6 +375,7 @@ def main():
         gen_account_noise(rng, tape, 2_000 + i, span_ms)
 
     day = 86_400_000
+    rules = []
     campaigns = [
         c_card_testing(rng, tape, 9_001, BASE_TS + int(0.4 * day)),
         c_card_testing(rng, tape, 9_002, BASE_TS + int(1.6 * day)),
@@ -359,16 +395,49 @@ def main():
                       [850.00, 920.00, 880.00, 940.00]),
         c_structuring(rng, tape, 8_202, BASE_TS + int(0.3 * day),
                       [870.00, 910.00], gap_h=(26, 28), expect="none"),
+        # Dynamic rules: a watchlist live from the start, a watchlist that
+        # activates mid-tape (the same card's auths flip from silent to
+        # alerting at the boundary), an amount cap, and a control whose
+        # rule activates only after its auths.
+        c_rule_merchant(rng, tape, rules, 9_301, "grey-imports",
+                        "merchant_watchlist", BASE_TS,
+                        [(BASE_TS + int(0.8 * day), 95.00),
+                         (BASE_TS + int(1.5 * day), 140.00)]),
+        c_rule_merchant(rng, tape, rules, 9_302, "night-bazaar",
+                        "merchant_watchlist", BASE_TS + int(1.5 * day),
+                        [(BASE_TS + int(0.6 * day), 60.00),
+                         (BASE_TS + int(1.0 * day), 75.00),
+                         (BASE_TS + int(1.9 * day), 82.00),
+                         (BASE_TS + int(2.4 * day), 66.00)]),
+        c_rule_merchant(rng, tape, rules, 9_303, "grand-casino",
+                        "merchant_cap", BASE_TS,
+                        [(BASE_TS + int(0.5 * day), 320.00),
+                         (BASE_TS + int(1.1 * day), 480.00),
+                         (BASE_TS + int(1.7 * day), 650.00),
+                         (BASE_TS + int(2.3 * day), 720.00)], cap=500.00),
+        c_rule_merchant(rng, tape, rules, 9_304, "pop-up-vintage",
+                        "merchant_watchlist", BASE_TS + int(2.9 * day),
+                        [(BASE_TS + int(0.5 * day), 45.00),
+                         (BASE_TS + int(1.2 * day), 58.00)]),
     ]
 
     os.makedirs(args.out, exist_ok=True)
     n = tape.write(os.path.join(args.out, "events.ndjson"))
 
-    expected = [
-        {"pattern": c["pattern"], "entity_kind": c["entity_kind"],
-         "entity_id": c["entity_id"]}
-        for c in campaigns if c["expect"] == "alert"
-    ]
+    with open(os.path.join(args.out, "rules.ndjson"), "w") as f:
+        for r in rules:
+            f.write(json.dumps(r, separators=(",", ":")) + "\n")
+        f.write(json.dumps({"kind": "end_of_rules", "merchant": "",
+                            "activate_at": 0, "cap": 0.0},
+                           separators=(",", ":")) + "\n")
+
+    expected = []
+    for c in campaigns:
+        count = c.get("alerts", 1 if c["expect"] == "alert" else 0)
+        expected.extend(
+            [{"pattern": c["pattern"], "entity_kind": c["entity_kind"],
+              "entity_id": c["entity_id"]}] * count
+        )
     manifest = {
         "seed": args.seed,
         "days": args.days,

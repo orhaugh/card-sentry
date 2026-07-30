@@ -21,7 +21,8 @@ if [[ ! -x "${PREFIX}/bin/clink" ]]; then
     exit 2
 fi
 
-if [[ "${REGEN:-0}" == "1" || ! -f "${ROOT}/data/events.ndjson" ]]; then
+if [[ "${REGEN:-0}" == "1" || ! -f "${ROOT}/data/events.ndjson" \
+      || ! -f "${ROOT}/data/rules.ndjson" ]]; then
     python3 "${ROOT}/tools/csgen.py" --seed "${SEED}" --out "${ROOT}/data"
 fi
 

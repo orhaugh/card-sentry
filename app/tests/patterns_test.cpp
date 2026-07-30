@@ -5,15 +5,24 @@
 // deterministically. Plain main(), non-zero exit on failure - no test
 // framework dependency.
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include <clink/operators/sink_operator.hpp>
+#include <clink/operators/source_operator.hpp>
+#include <clink/runtime/dag.hpp>
+#include <clink/runtime/local_executor.hpp>
+#include <clink/state/in_memory_state_backend.hpp>
 #include <clink/test/one_input_harness.hpp>
 
 #include "events.hpp"
 #include "patterns.hpp"
+#include "rules.hpp"
+#include "watchlist.hpp"
 
 namespace {
 
@@ -351,6 +360,97 @@ void test_structuring_running_total_trips() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Watchlist (broadcast rules). Driven through a real two-source Dag - the
+// harness is single-input - and asserted as SETS because the two streams
+// race by design; effective dating and the seal barrier make the output
+// set identical for every interleaving.
+// ---------------------------------------------------------------------------
+
+cs::Event auth_at(const std::string& merchant, std::int64_t card, double amount,
+                  std::int64_t ts) {
+    cs::Event e = auth(card, amount, true, ts);
+    e.present = true;
+    e.merchant = merchant;
+    return e;
+}
+
+cs::Rule rule(cs::RuleKind kind, const std::string& merchant, std::int64_t activate_at,
+              double cap = 0.0) {
+    cs::Rule r;
+    r.kind = kind;
+    r.merchant = merchant;
+    r.activate_at = activate_at;
+    r.cap = cap;
+    return r;
+}
+
+std::vector<std::tuple<std::string, std::int64_t, std::int64_t>> run_watchlist(
+    std::vector<cs::Rule> rules, std::vector<cs::Event> events) {
+    using namespace clink;
+    Dag dag;
+    std::vector<Record<cs::Rule>> rule_records;
+    rule_records.reserve(rules.size());
+    for (auto& r : rules) {
+        rule_records.push_back(Record<cs::Rule>{std::move(r)});
+    }
+    std::vector<Record<cs::Event>> event_records;
+    event_records.reserve(events.size());
+    for (auto& e : events) {
+        event_records.push_back(Record<cs::Event>{std::move(e)});
+    }
+    auto h_rules = dag.add_source<cs::Rule>(
+        std::make_shared<VectorSource<cs::Rule>>(std::move(rule_records)));
+    auto h_events = dag.add_source<cs::Event>(
+        std::make_shared<VectorSource<cs::Event>>(std::move(event_records)));
+
+    auto fn = std::make_shared<cs::WatchlistFn>();
+    auto [pb, pm] = detail::build_broadcast_process_callbacks<cs::Event, cs::Rule, cs::Alert,
+                                                              cs::RuleSet>(fn);
+    auto h_out = dag.broadcast_process<cs::Event, cs::Rule, cs::Alert, cs::RuleSet>(
+        h_events, h_rules, pb, pm, cs::rule_set_codec(), "cs_watchlist_rules", "watchlist");
+    auto sink = std::make_shared<CollectingSink<cs::Alert>>();
+    dag.add_sink<cs::Alert>(h_out, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    std::vector<std::tuple<std::string, std::int64_t, std::int64_t>> got;
+    for (const auto& a : sink->collected()) {
+        got.emplace_back(a.pattern, a.entity_id, a.ts);
+    }
+    std::sort(got.begin(), got.end());
+    return got;
+}
+
+void test_watchlist_effective_dating_and_cap() {
+    const auto got = run_watchlist(
+        {rule(cs::RuleKind::MerchantWatchlist, "grey-imports", T0 + 1'000),
+         rule(cs::RuleKind::MerchantCap, "grand-casino", T0, 500.0),
+         rule(cs::RuleKind::EndOfRules, "", 0)},
+        {auth_at("grey-imports", 9301, 95.0, T0 + 500),     // pre-activation
+         auth_at("grey-imports", 9301, 140.0, T0 + 1'500),  // post -> hit
+         auth_at("grand-casino", 9303, 400.0, T0 + 2'000),  // under cap
+         auth_at("grand-casino", 9303, 650.0, T0 + 2'500),  // over -> hit
+         auth_at("corner-espresso", 1001, 900.0, T0 + 3'000)});  // no rule
+    const std::vector<std::tuple<std::string, std::int64_t, std::int64_t>> want{
+        {"cap_exceeded", 9303, T0 + 2'500},
+        {"watchlist_hit", 9301, T0 + 1'500},
+    };
+    CHECK(got == want);
+}
+
+void test_watchlist_unsealed_rules_stay_silent() {
+    // No end_of_rules marker: the bootstrap barrier never lifts, so a
+    // broken rules feed under-alerts to exactly zero - loud at the oracle.
+    const auto got = run_watchlist(
+        {rule(cs::RuleKind::MerchantWatchlist, "grey-imports", T0)},
+        {auth_at("grey-imports", 9301, 95.0, T0 + 500)});
+    CHECK(got.empty());
+}
+
 }  // namespace
 
 int main() {
@@ -360,6 +460,8 @@ int main() {
     test_account_takeover_negation_zones();
     test_otp_timeout_rides_the_side_output();
     test_structuring_running_total_trips();
+    test_watchlist_effective_dating_and_cap();
+    test_watchlist_unsealed_rules_stay_silent();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed\n";
