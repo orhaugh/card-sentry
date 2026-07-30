@@ -1,0 +1,68 @@
+# card-sentry CI: install clink the way the README tells a human to, then
+# run everything that runs without Docker - build the detectors against the
+# installed package, run the per-pattern harness tests and the
+# schema-evolution test, generate the tape, and gate the detections against
+# the manifest oracle.
+#
+# clink is built from `main` because the detectors depend on engine fixes
+# newer than the last release (the OTP timed-out surface, the EOS
+# final-checkpoint fix for side-output sinks, plugin-typed replay, ...).
+# When those land in a tagged release this flips to CLINK_VERSION=<tag> and
+# the prebuilt-SDK fast path (see scripts/get-clink.sh).
+#
+# The cluster scenes (cluster/run.sh, run-2pc.sh, replay.sh) need Docker and
+# a runtime-image build; they run locally, not here.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Build clink from main until the detectors' engine fixes are released.
+  CLINK_VERSION: main
+  # No object-store Arrow (nothing here uses s3://): lets the pinned
+  # toolchain build on a bare runner without the aws-sdk at /usr/local.
+  CLINK_ARROW_OBJECT_STORES: "OFF"
+  CLINK_SKIP_ICEBERG: "1"
+  CC: gcc-14
+  CXX: g++-14
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache only the pinned Arrow/Parquet toolchain (stable across clink
+      # commits); clink itself rebuilds each run while we track main.
+      - name: Restore the pinned clink toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps
+          key: clink-deps-${{ runner.os }}-${{ runner.arch }}-obj${{ env.CLINK_ARROW_OBJECT_STORES }}-gcc14-v1
+
+      - name: Tooling and clink's system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential g++-14 git curl ca-certificates pkg-config \
+            libssl-dev libcurl4-openssl-dev libsqlite3-dev libxml2-dev \
+            libzstd-dev zlib1g-dev
+
+      - name: Install clink (from main)
+        run: scripts/get-clink.sh
+
+      - name: Build the detectors against the installed package
+        run: |
+          cmake -S app -B app/build -DCMAKE_PREFIX_PATH=$PWD/.clink/prefix
+          cmake --build app/build --parallel 4
+
+      - name: Harness + schema-evolution tests
+        run: ctest --test-dir app/build --output-on-failure
+
+      - name: Generate the tape and gate detections against the oracle
+        run: scripts/run-detections.sh
