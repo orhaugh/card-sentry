@@ -16,17 +16,19 @@ any project would - and it doubles as an integration test of the engine
 surface it exercises. Its first run found a real CEP correctness defect
 (below), which was fixed in clink before this repository's first commit.
 
-**Status: round 3 in progress.** Embedded detection over the tape,
+**Status: round 3 complete.** Embedded detection over the tape,
 oracle-gated, with per-pattern harness tests; dynamic rules over broadcast
 state; the per-card risk profile served over clink's queryable-state HTTP
-surface; and the five CEP detectors deployed to a real coordinator +
-two-worker cluster as a compiled job plugin, gated against the same
-oracle. The detectors require clink `main` (they depend on fixes newer
-than v0.4.0), so install with `CLINK_SOURCE` pointing at a clink checkout;
-the pin flips to the next release when it exists. Planned next:
-exactly-once alert delivery to Postgres on the cluster (kill a worker
-mid-run, the case table stays exact), incident replay with `--emit-test`,
-and savepoint schema evolution.
+surface; the five CEP detectors deployed to a real coordinator +
+two-worker cluster as a compiled job plugin; exactly-once alert delivery
+to Postgres verified across a hard worker kill mid-run (the case table
+holds exactly the manifest's alerts, no duplicates, no gaps); incident
+replay that freezes a fired alert into a regression bundle; and schema
+evolution of the risk-profile state across a version bump with a
+pre-deploy compatibility gate. The detectors require clink `main` (they
+depend on fixes newer than v0.4.0), so install with `CLINK_SOURCE`
+pointing at a clink checkout; the pin flips to the next release when it
+exists.
 
 ## Quick start
 
@@ -146,6 +148,48 @@ to end: through the spec, the planner's chains, and the workers' network
 channels. The dashboard is live at http://localhost:8081 during the run
 (`KEEP_UP=1` leaves it up).
 
+## Kill the detector, the case table doesn't lie
+
+`cluster/run-2pc.sh` adds an exactly-once Postgres case store: every alert
+also lands through clink's two-phase-commit sink (`PREPARE TRANSACTION` at
+the barrier, `COMMIT PREPARED` when the checkpoint is globally durable).
+Mid-run it `kill -9`s a worker; the coordinator rolls the whole job back
+to the last checkpoint, redeploys on the survivor, and the case table ends
+holding **exactly** the manifest's alerts - no duplicates from the replay,
+no gaps from the crash:
+
+```
+== killing worker2 mid-run
+case table: 9 rows, expected 9
+OK: killed a worker mid-run; the case table holds exactly the manifest's alerts.
+```
+
+The file-sink outputs are at-least-once by design and carry post-restore
+duplicates; the exactly-once contract is the case table alone. Getting
+this to pass drove three engine fixes (findings 6-8).
+
+## Every alert is evidence
+
+`cluster/replay.sh` runs the detectors with the flight recorder armed,
+then - offline, engine stopped - `capture-cat` lists what each operator
+consumed per epoch, `clink replay --verify` re-executes an epoch
+byte-identically, and `--emit-test` freezes it into a self-contained
+regression bundle. For fraud, "why did the detector fire at 09:17" is a
+compliance question; replay makes the answer reproducible and turns the
+incident into a permanent test. The detectors are custom-typed
+(`cs_event->cs_alert`), which needed clink's replay to grow beyond its SQL
+Row path (finding 9).
+
+## The upgrade nobody notices
+
+`app/src/risk_profile_v2.hpp` evolves the per-card profile to v2 (adds a
+first-seen timestamp) with a registered `1->2` migration.
+`app/tests/schema_evolution_test.cpp` shows the consumer contract: a v1
+savepoint value migrates to v2 preserving every field, and clink's
+pre-deploy compatibility gate passes once the migration is registered and
+flags the same upgrade as incompatible without it - stopping a
+data-losing deploy before it starts.
+
 ## Verification
 
 Three independent gates, all run by `scripts/run-detections.sh`:
@@ -203,25 +247,55 @@ showcase that doubles as an integration test:
    to any in-process test. Fixed alongside the other bundle-scoped
    registry lookups; this repository's containerised gate is the
    regression home for the class.
+6. **Sibling stateful sinks collided on one OperatorId.** A sink built on
+   the cluster with no uid position-hashed to an id shared by every
+   same-type sink in a same-shaped subtask - which the 2PC sink keys its
+   `PREPARE TRANSACTION` gid and per-checkpoint state on, so five case
+   sinks raced one gid. Found by the 2PC scene; fixed across all three
+   cluster sink-build paths to fall back to the unique spec node id.
+7. **A mid-stream worker kill cascaded to job failure.** Worker-loss
+   recovery relocated only the lost worker's subtasks, leaving survivors
+   running with stale bridges to the moved peers; those "peer gone" send
+   failures each spawned a fresh restart until the budget was gone. Fixed
+   to roll the whole job back to the last checkpoint atomically.
+8. **A checkpointed bounded job with a side-output sink hung forever.**
+   The deepest one, and not 2PC at all: checkpoint barriers never reached
+   side-output channels, so a side-output consumer never acked, and the
+   bounded source's EOS final checkpoint never committed. Two isolation
+   runs (no kill, no Postgres) pinned it. Fixed so barriers and watermarks
+   propagate on every output edge - the Chandy-Lamport requirement.
+9. **`clink replay` was SQL-Row only.** It could not re-execute a custom
+   plugin operator (`cs_event->cs_alert`). Now `register_operator<In,Out>`
+   hangs a type-erased replay driver on the op's factory, so
+   `clink replay --plugin --verify` / `--emit-test` work on custom types;
+   a single-op replay also discards unregistered side-output emits.
+
+The 2PC scene alone surfaced 6, 7 and 8 - a bounded source, checkpointing,
+side outputs and fan-out on a cluster was untested territory until this
+repository drove it. Every fix ships with a regression test in clink.
 
 ## Layout
 
 ```
-scripts/get-clink.sh          install clink (release tag, or CLINK_SOURCE=<checkout>)
-scripts/run-detections.sh     generate -> build -> test -> detect -> verify
-scripts/scene-risk-lookup.sh  queryable-state scene: served profiles vs the tape
-cluster/run.sh                cluster scene: in-image plugin build -> submit -> gate
-cluster/docker-compose.yml    coordinator + two workers (clink-runtime image)
-tools/csgen.py                deterministic tape + rules + manifest generator
-tools/check.py                the oracle (--only-patterns for subset deployments)
-app/src/events.hpp            event model, parser, codecs, haversine, alerts
-app/src/patterns.hpp          shared pattern builders + alert selectors
-app/src/rules.hpp             effective-dated rule model + codec
-app/src/watchlist.hpp         broadcast-state watchlist detector
-app/src/risk_profile.hpp      per-card profile + queryable-state binding
-app/src/card_sentry.cpp       the embedded pipeline
-app/src/card_sentry_job.cpp   the same detectors as a job plugin (.so)
-app/tests/patterns_test.cpp   harness tests per detector
+scripts/get-clink.sh            install clink (release tag, or CLINK_SOURCE=<checkout>)
+scripts/run-detections.sh       generate -> build -> test -> detect -> verify
+scripts/scene-risk-lookup.sh    queryable-state scene: served profiles vs the tape
+cluster/run.sh                  cluster scene: in-image plugin build -> submit -> gate
+cluster/run-2pc.sh              2PC exactly-once + kill-a-worker; NO_KILL / NO_PG switches
+cluster/replay.sh               capture -> replay --verify -> --emit-test bundle
+cluster/docker-compose.yml      coordinator + two workers + postgres
+tools/csgen.py                  deterministic tape + rules + manifest generator
+tools/check.py                  the oracle (--only-patterns for subset deployments)
+app/src/events.hpp              event model, parser, codecs, haversine, alerts
+app/src/patterns.hpp            shared pattern builders + alert selectors
+app/src/rules.hpp               effective-dated rule model + codec
+app/src/watchlist.hpp           broadcast-state watchlist detector
+app/src/risk_profile.hpp        per-card profile + queryable-state binding
+app/src/risk_profile_v2.hpp     the evolved profile (v2) + the v1->v2 migration
+app/src/card_sentry.cpp         the embedded pipeline
+app/src/card_sentry_job.cpp     the same detectors as a job plugin (.so)
+app/tests/patterns_test.cpp     harness tests per detector
+app/tests/schema_evolution_test.cpp   migration + pre-deploy compatibility gate
 ```
 
 ## Pinning
