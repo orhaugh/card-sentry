@@ -26,8 +26,25 @@ services:
     volumes:
       - ..:/mnt/card-sentry:ro   # consumer checkout (in-image plugin build)
       - ./jobs:/jobs             # built .so lands here for the submitter
+      - ./ckpt:/ckpt             # shared checkpoint root (2PC scene)
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/api/v1/health >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  # The 2PC scene's case store. max_prepared_transactions > 0 is the
+  # server-side requirement of PREPARE TRANSACTION / COMMIT PREPARED,
+  # which is what clink's exactly-once postgres sink is built on.
+  postgres:
+    image: postgres:16
+    command: postgres -c max_prepared_transactions=32
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: sentry
+      POSTGRES_DB: sentry
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry -d sentry"]
       interval: 3s
       timeout: 5s
       retries: 30
@@ -37,12 +54,13 @@ services:
     command: >
       clink_node --role=worker --id=worker-1
                  --coordinator-host=coordinator --coordinator-port=6123
-                 --data-host=worker1 --slots=16
+                 --data-host=worker1 --slots=40
     environment:
       CLINK_DATA_BIND_HOST: 0.0.0.0
     volumes:
       - ../data:/data:ro
       - ../out-cluster:/out
+      - ./ckpt:/ckpt
     depends_on:
       coordinator:
         condition: service_healthy
@@ -53,12 +71,13 @@ services:
     command: >
       clink_node --role=worker --id=worker-2
                  --coordinator-host=coordinator --coordinator-port=6123
-                 --data-host=worker2 --slots=16
+                 --data-host=worker2 --slots=40
     environment:
       CLINK_DATA_BIND_HOST: 0.0.0.0
     volumes:
       - ../data:/data:ro
       - ../out-cluster:/out
+      - ./ckpt:/ckpt
     depends_on:
       coordinator:
         condition: service_healthy

@@ -19,6 +19,11 @@
 // baked into the graph spec:
 //   CS_EVENTS   input tape path as workers see it (default /data/events.ndjson)
 //   CS_OUT_DIR  alert output directory as workers see it (default /out)
+//   CS_PG_DSN   when set, every alert ALSO lands in Postgres through the
+//               exactly-once two-phase-commit sink (PREPARE TRANSACTION /
+//               COMMIT PREPARED, committed when its checkpoint is globally
+//               durable) - the 2PC kill-a-worker scene's case store
+//   CS_PG_TABLE the case table (default "alerts")
 
 #include <chrono>
 #include <cstdlib>
@@ -54,6 +59,8 @@ void define_job(clink::api::Pipeline& env) {
 
     const std::string in = env_or("CS_EVENTS", "/data/events.ndjson");
     const std::string out_dir = env_or("CS_OUT_DIR", "/out");
+    const std::string pg_dsn = env_or("CS_PG_DSN", "");
+    const std::string pg_table = env_or("CS_PG_TABLE", "alerts");
 
     auto events =
         env.source<std::string>(clink::api::FileTextSource::builder().path(in).build())
@@ -67,12 +74,33 @@ void define_job(clink::api::Pipeline& env) {
             .assign_timestamps_bounded([](const Event& e) { return clink::EventTime{e.ts}; },
                                        std::chrono::seconds(60));
 
-    const auto sink_alerts = [&out_dir](clink::api::DataStream<Alert> stream,
-                                        const std::string& name) {
-        stream.map<std::string>([](const Alert& a) { return cs::alert_to_json(a); })
-            .sink(clink::api::FileTextSink::builder()
-                      .path(out_dir + "/alerts-" + name + ".ndjson")
-                      .build());
+    const auto sink_alerts = [&out_dir, &pg_dsn, &pg_table](clink::api::DataStream<Alert> stream,
+                                                            const std::string& name) {
+        auto jsons =
+            stream.map<std::string>([](const Alert& a) { return cs::alert_to_json(a); });
+        jsons.sink(clink::api::FileTextSink::builder()
+                       .path(out_dir + "/alerts-" + name + ".ndjson")
+                       .build());
+        if (!pg_dsn.empty()) {
+            // The exactly-once case store: rows land iff their checkpoint
+            // completes globally; a prepared-but-uncommitted transaction
+            // survives a worker crash and is committed on restart. The
+            // sink consumes the alert JSON directly - keys map to the
+            // case table's columns.
+            //
+            // The explicit id is the sink's STABLE identity: a 2PC sink
+            // names its PREPARE TRANSACTION gid after its operator id, so
+            // sibling sinks must not share one. A per-detector id keeps
+            // each sink's transactions (and its per-checkpoint committable
+            // state) distinct and stable across restarts.
+            clink::api::SinkDescriptor pg;
+            pg.op_type = "postgres_2pc_sink";
+            pg.channel_type = "string";
+            pg.params = {{"conninfo", pg_dsn},
+                         {"table", pg_table},
+                         {"columns", "pattern,entity_kind,entity_id,ts,detail"}};
+            jsons.sink(pg, "cs-case-sink-" + name);
+        }
     };
 
     // card_testing: declined-probe burst then an approved strike.
