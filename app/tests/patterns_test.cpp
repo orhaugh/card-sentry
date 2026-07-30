@@ -17,10 +17,12 @@
 #include <clink/runtime/dag.hpp>
 #include <clink/runtime/local_executor.hpp>
 #include <clink/state/in_memory_state_backend.hpp>
+#include <clink/test/keyed_harness.hpp>
 #include <clink/test/one_input_harness.hpp>
 
 #include "events.hpp"
 #include "patterns.hpp"
+#include "risk_profile.hpp"
 #include "rules.hpp"
 #include "watchlist.hpp"
 
@@ -451,6 +453,43 @@ void test_watchlist_unsealed_rules_stay_silent() {
     CHECK(got.empty());
 }
 
+// ---------------------------------------------------------------------------
+// Risk profile: state inspected through the production read path, and the
+// late-arrival guard on last_country pinned.
+// ---------------------------------------------------------------------------
+
+void test_risk_profile_folds_auths_and_survives_late_arrivals() {
+    auto h = clink::test::make_keyed_process_function_harness(
+        cs::RiskProfileFn{}, [](const cs::Event& e) { return e.card; });
+    h.open();
+
+    cs::Event a1 = auth(9001, 1.20, false, T0);
+    a1.country = "GB";
+    cs::Event a2 = auth(9001, 486.31, true, T0 + 120'000);
+    a2.country = "SG";
+    // A LATE arrival: older event time, processed after a2. It must count
+    // in the totals but not steal last_country from the newer auth.
+    cs::Event a3 = auth(9001, 0.80, false, T0 + 60'000);
+    a3.country = "FR";
+    h.process_element(a1);
+    h.process_element(a2);
+    h.process_element(a3);
+
+    const auto p = h.template state_value<cs::RiskProfile>(
+        9001, "profile", clink::int64_codec(), cs::profile_codec());
+    CHECK(p.has_value());
+    if (p.has_value()) {
+        CHECK(p->auths == 3);
+        CHECK(p->declines == 2);
+        CHECK(std::abs(p->total - 488.31) < 0.01);
+        CHECK(std::abs(p->max_amount - 486.31) < 0.01);
+        CHECK(p->last_ts == T0 + 120'000);
+        CHECK(p->last_country == "SG");
+        CHECK(cs::risk_score(*p) == 65);  // 2 declines x 25 + large-ticket 15
+    }
+    CHECK(h.output_values().empty());  // the profile op never alerts
+}
+
 }  // namespace
 
 int main() {
@@ -462,6 +501,7 @@ int main() {
     test_structuring_running_total_trips();
     test_watchlist_effective_dating_and_cap();
     test_watchlist_unsealed_rules_stay_silent();
+    test_risk_profile_folds_auths_and_survives_late_arrivals();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed\n";

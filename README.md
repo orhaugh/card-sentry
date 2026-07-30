@@ -16,15 +16,17 @@ any project would - and it doubles as an integration test of the engine
 surface it exercises. Its first run found a real CEP correctness defect
 (below), which was fixed in clink before this repository's first commit.
 
-**Status: round 1.** Embedded detection over the tape, oracle-gated, with
-per-pattern harness tests. The detectors currently require clink `main`
-(they depend on a CEP fix newer than v0.4.0), so install with
-`CLINK_SOURCE` pointing at a clink checkout; the pin flips to the next
-release when it exists. Planned rounds: dynamic rules over broadcast state,
-live risk lookup through queryable state, exactly-once alert delivery to
-Postgres (kill the detector mid-run, the case table stays exact), cluster
-deployment as a compiled job plugin, savepoint schema evolution, and
-incident replay with `--emit-test`.
+**Status: round 2.** Embedded detection over the tape, oracle-gated, with
+per-pattern harness tests; plus dynamic rules over broadcast state (a
+second stream of effective-dated watchlists joining the auths) and the
+per-card risk profile served over clink's queryable-state HTTP surface.
+The detectors currently require clink `main` (they depend on fixes newer
+than v0.4.0), so install with `CLINK_SOURCE` pointing at a clink checkout;
+the pin flips to the next release when it exists. Planned next: cluster
+deployment as a compiled job plugin with exactly-once alert delivery to
+Postgres (kill a worker mid-run, the case table stays exact - the 2PC
+commit path is coordinator-driven, so it belongs with the cluster scene),
+savepoint schema evolution, and incident replay with `--emit-test`.
 
 ## Quick start
 
@@ -74,29 +76,47 @@ Each detector exercises a distinct part of the pattern DSL
 | `account_takeover` | Failed logins, password change, draining transfer, and never an OTP verify in between | Two `not_followed_by` negative zones inside one sequence |
 | `otp_never_verified` | OTP requested, verification never arrives | The pattern describes the HEALTHY flow; the alert is the **timed-out side output** - the partial that never completed |
 | `structuring` | Transfers just under a reporting threshold whose running total crosses the trip line | Complementary iterative predicates: the quantified step captures while the sum stays below the threshold, the tip step takes exactly the transfer that crosses it, so the greedy quantifier can never swallow the trip |
+| `watchlist_hit` / `cap_exceeded` | Auths at merchants on a watchlist, or over a per-merchant cap, where the rules arrive on a SECOND stream and change mid-tape without a redeploy | **Broadcast state** (`BroadcastProcessFunction`): effective-dated rules make outcomes depend only on event times, an `end_of_rules` marker seals the set, and a bootstrap buffer keeps early auths from outrunning the rules |
 
-All five run in one embedded pipeline (`app/src/card_sentry.cpp`):
+All detectors run in one embedded pipeline (`app/src/card_sentry.cpp`),
+alongside a per-card risk profile that emits nothing and instead serves
+its keyed state over HTTP (next section):
 
 ```mermaid
 graph LR
-  A["FileSource"] --> B["FlatMap parse"]
+  A["FileSource events"] --> B["FlatMap parse"]
   B --> C["WatermarkAssigner<br/>bounded 60 s"]
-  C --> D["fork x5<br/>broadcast tee"]
-  D --> E1["card_testing"]
-  D --> E2["impossible_travel"]
-  D --> E3["account_takeover"]
-  D --> E4["otp_never_verified<br/>timed-out side output"]
-  D --> E5["structuring"]
+  C --> D["fork x7<br/>broadcast tee"]
+  D --> E1["5x CepOperator<br/>patterns above"]
+  D --> E6["watchlist<br/>broadcast_process"]
+  R["FileSource rules"] --> RP["FlatMap parse"]
+  RP --> E6
+  D --> E7["risk profile<br/>keyed state, no alerts"]
   E1 --> U["union"]
-  E2 --> U
-  E3 --> U
-  E4 --> U
-  E5 --> U
+  E6 --> U
   U --> S["FileSink alerts.ndjson"]
 ```
 
 Branch threads interleave, so the alert file's order varies run to run;
 the alert SET is deterministic, and the checker compares sets.
+
+## Live risk lookup: state served, not exported
+
+`app/src/risk_profile.hpp` folds every auth into a per-card profile held
+in a keyed-state slot - checkpointable, restorable, harness-inspectable -
+and registers a JSON lookup plus a bounded scan in clink's
+queryable-state registry. With `--serve-state <port>` the app hosts the
+engine's own HTTP routes once the tape drains:
+
+```bash
+curl 'localhost:7071/api/v1/queryable_state/op/cs/subtask/0/json/risk_profile?key=9001'
+# {"key":"9001","value":{"card":9001,"auths":7,"declines":6,...,"score":100}}
+```
+
+`scripts/scene-risk-lookup.sh` gates the served JSON against an
+expectation computed independently from the tape by Python: point lookups
+field for field, a 404 for a card that never authed, and the `/scan`
+route returning profiles - state as a table over HTTP, no export step.
 
 ## Verification
 
@@ -111,10 +131,10 @@ Three independent gates, all run by `scripts/run-detections.sh`:
    every negative control, and zero alerts anywhere else.
 3. **Determinism**: same tape, same alert set, every run.
 
-## What the first round found in the engine
+## What building this found in the engine
 
-Building this repository surfaced two engine-level findings on day one -
-the point of a consumer showcase that doubles as an integration test:
+Each round surfaced real engine-level findings - the point of a consumer
+showcase that doubles as an integration test:
 
 1. **`within()` was not enforced at match time.** A pattern's completing
    event arriving *between watermarks* could produce a match whose
@@ -129,18 +149,31 @@ the point of a consumer showcase that doubles as an integration test:
    skew (what this tape's noise now guarantees) or a reordering stage
    upstream (a candidate engine feature). The contract is now stated
    explicitly in clink's CEP documentation.
+3. **The installed package under-declared OpenSSL.** clink's HTTP
+   subsystem (built with TLS) references OpenSSL symbols from inside
+   `libclink_core.a`, but the usage requirement was stripped from the
+   installed CMake package along with the non-exportable header-only
+   httplib target - so any consumer touching the HTTP surface failed at
+   link with undefined OpenSSL symbols. Found the moment this repo's
+   queryable-state scene linked; fixed in clink's export set and
+   generated package config (TLS-off builds still take no OpenSSL
+   dependency).
 
 ## Layout
 
 ```
-scripts/get-clink.sh        install clink (release tag, or CLINK_SOURCE=<checkout>)
-scripts/run-detections.sh   generate -> build -> test -> detect -> verify
-tools/csgen.py              deterministic tape + manifest generator
-tools/check.py              the oracle
-app/src/events.hpp          event model, parser, codec, haversine, alerts
-app/src/patterns.hpp        the five detectors
-app/src/card_sentry.cpp     the embedded pipeline
-app/tests/patterns_test.cpp harness tests per pattern
+scripts/get-clink.sh          install clink (release tag, or CLINK_SOURCE=<checkout>)
+scripts/run-detections.sh     generate -> build -> test -> detect -> verify
+scripts/scene-risk-lookup.sh  queryable-state scene: served profiles vs the tape
+tools/csgen.py                deterministic tape + rules + manifest generator
+tools/check.py                the oracle
+app/src/events.hpp            event model, parser, codec, haversine, alerts
+app/src/patterns.hpp          the five CEP detectors
+app/src/rules.hpp             effective-dated rule model + codec
+app/src/watchlist.hpp         broadcast-state watchlist detector
+app/src/risk_profile.hpp      per-card profile + queryable-state binding
+app/src/card_sentry.cpp       the embedded pipeline
+app/tests/patterns_test.cpp   harness tests per detector
 ```
 
 ## Pinning

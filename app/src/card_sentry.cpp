@@ -29,20 +29,26 @@
 //   ./app/build/card_sentry --in data/events.ndjson --out out/alerts.ndjson
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <clink/connectors/file_sink.hpp>
 #include <clink/connectors/file_source.hpp>
 #include <clink/connectors/text_format.hpp>
+#include <clink/http/http_server.hpp>
 #include <clink/operators/flat_map_operator.hpp>
 #include <clink/operators/map_operator.hpp>
+#include <clink/operators/process_function.hpp>
 #include <clink/operators/watermark_assigner_operator.hpp>
+#include <clink/queryable_state/registry.hpp>
+#include <clink/queryable_state/server.hpp>
 #include <clink/runtime/dag.hpp>
 #include <clink/runtime/local_executor.hpp>
 #include <clink/state/in_memory_state_backend.hpp>
@@ -50,6 +56,7 @@
 
 #include "events.hpp"
 #include "patterns.hpp"
+#include "risk_profile.hpp"
 #include "rules.hpp"
 #include "watchlist.hpp"
 
@@ -90,6 +97,10 @@ int main(int argc, char** argv) {
     const std::string in = arg_or(argc, argv, "in", "data/events.ndjson");
     const std::string rules_in = arg_or(argc, argv, "rules", "data/rules.ndjson");
     const std::string out = arg_or(argc, argv, "out", "out/alerts.ndjson");
+    // --serve-state <port>: after the tape drains, serve the risk-profile
+    // state over the queryable-state HTTP routes for --hold seconds.
+    const int serve_port = std::stoi(arg_or(argc, argv, "serve-state", "0"));
+    const int hold_s = std::stoi(arg_or(argc, argv, "hold", "20"));
 
     if (!std::filesystem::exists(in) || !std::filesystem::exists(rules_in)) {
         std::cerr << "input not found: " << in << " / " << rules_in
@@ -120,7 +131,8 @@ int main(int argc, char** argv) {
     auto h_parsed = dag.add_operator<std::string, cs::Event>(h_src, parse);
     auto h_timed = dag.add_operator<cs::Event, cs::Event>(h_parsed, assigner);
 
-    auto branches = dag.fork<cs::Event>(h_timed, 6);
+    auto branches = dag.fork<cs::Event>(h_timed, 7);
+    clink::queryable_state::Registry state_registry;
 
     std::vector<StageHandle<cs::Alert>> alert_streams;
 
@@ -191,6 +203,22 @@ int main(int argc, char** argv) {
         alert_streams.push_back(dag.broadcast_process<cs::Event, cs::Rule, cs::Alert, cs::RuleSet>(
             h_auths, h_rules, pb, pm, cs::rule_set_codec(), "cs_watchlist_rules", "watchlist"));
     }
+    // risk profile: per-card auth statistics in keyed state, served over
+    // the queryable-state HTTP surface (--serve-state). Emits no alerts.
+    {
+        auto h = dag.add_operator<cs::Event, cs::Event>(
+            branches[6], keep_types({cs::EventType::Auth}));
+        auto fn = std::make_shared<cs::RiskProfileFn>(&state_registry);
+        auto keyed =
+            std::make_shared<detail::KeyedProcessFunctionAdapter<std::int64_t, cs::Event,
+                                                                 cs::Alert>>(
+                fn, [](const cs::Event& e) { return e.card; }, nullptr, "risk_profile");
+        keyed->set_uid("cs-risk-profile");
+        auto h_profile = dag.add_operator<cs::Event, cs::Alert>(h, keyed);
+        auto drop_none = std::make_shared<FlatMapOperator<cs::Alert, cs::Alert>>(
+            [](const cs::Alert&) { return std::vector<cs::Alert>{}; });
+        alert_streams.push_back(dag.add_operator<cs::Alert, cs::Alert>(h_profile, drop_none));
+    }
 
     auto h_alerts = dag.union_streams<cs::Alert>(alert_streams);
     auto render = std::make_shared<MapOperator<cs::Alert, std::string>>(
@@ -204,6 +232,21 @@ int main(int argc, char** argv) {
 
     LocalExecutor exec(std::move(dag), std::move(cfg));
     exec.run();
+
+    // The tape is drained; the risk-profile state is final and still
+    // live in the backend. Serve it over the queryable-state routes so
+    // external clients can read (and scan) it - the same surface a
+    // cluster worker exposes.
+    if (serve_port > 0) {
+        http::HttpServer server;
+        queryable_state::register_routes(server, state_registry);
+        server.start("127.0.0.1", static_cast<std::uint16_t>(serve_port));
+        std::cout << "serving queryable state on 127.0.0.1:" << serve_port << " for " << hold_s
+                  << "s (GET /api/v1/queryable_state/op/" << cs::kProfileRole
+                  << "/subtask/0/json/" << cs::kProfileSlot << "?key=<card>)" << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(hold_s));
+        server.stop();
+    }
 
     // Branch threads interleave, so the alert file's ORDER is not
     // deterministic; the alert SET is. Summarise per pattern.
