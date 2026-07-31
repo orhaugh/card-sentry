@@ -12,9 +12,7 @@ on a tape (windows, joins, aggregations), card-sentry is detection and
 response: sequences, absences, timeouts and dynamic response over the same
 engine. It is a downstream consumer, not part of clink - it installs clink
 into a local prefix and builds against the installed CMake package the way
-any project would - and it doubles as an integration test of the engine
-surface it exercises. Its first run found a real CEP correctness defect
-(below), which was fixed in clink before this repository's first commit.
+any project would.
 
 **Status: round 3 complete.** Embedded detection over the tape,
 oracle-gated, with per-pattern harness tests; dynamic rules over broadcast
@@ -200,77 +198,6 @@ Three independent gates, all run by `scripts/run-detections.sh`:
    manifest - exact multiset equality on the expected alerts, silence from
    every negative control, and zero alerts anywhere else.
 3. **Determinism**: same tape, same alert set, every run.
-
-## What building this found in the engine
-
-Each round surfaced real engine-level findings - the point of a consumer
-showcase that doubles as an integration test:
-
-1. **`within()` was not enforced at match time.** A pattern's completing
-   event arriving *between watermarks* could produce a match whose
-   event-time span exceeded `within()` - the bound was only applied by
-   watermark-driven eviction. Found by this repo's OTP harness test (a
-   verify arriving 40 minutes after its request completed a 5-minute
-   pattern "healthily"), fixed in clink `main` with regression tests, in
-   the operator and both contract comments.
-2. **CEP matches in arrival order, and that contract matters.** The
-   matcher does not buffer and re-sort by event time, so a stream whose
-   arrival skew can invert a pattern's steps needs gaps wider than the
-   skew (what this tape's noise now guarantees) or a reordering stage
-   upstream (a candidate engine feature). The contract is now stated
-   explicitly in clink's CEP documentation.
-3. **The installed package under-declared OpenSSL.** clink's HTTP
-   subsystem (built with TLS) references OpenSSL symbols from inside
-   `libclink_core.a`, but the usage requirement was stripped from the
-   installed CMake package along with the non-exportable header-only
-   httplib target - so any consumer touching the HTTP surface failed at
-   link with undefined OpenSSL symbols. Found the moment this repo's
-   queryable-state scene linked; fixed in clink's export set and
-   generated package config (TLS-off builds still take no OpenSSL
-   dependency).
-4. **The planner could fuse a side-output consumer into a chain.** The
-   chain-extension walk matched "the unique consumer" by upstream id
-   alone, ignoring the side tag, so a side consumer declared before the
-   main consumer was fused into the chain and received the MAIN stream:
-   every healthy OTP completion landed in the never-verified alert file,
-   the real main consumer starved (job permanently incomplete, zero
-   errors), and the timeouts vanished. Found by this repo's first plugin
-   submit; fixed with the failing declaration order pinned as an
-   in-process cluster regression.
-5. **Plugin-typed side outputs failed to attach on a real cluster.**
-   Unmasked by fixing 4: the worker's chain dispatch resolved side-output
-   attachers from the process-wide default registry (built-ins only)
-   instead of the job bundle's registry where a dlopen'd plugin's types
-   land - Linux-only, since macOS unifies the singletons, and invisible
-   to any in-process test. Fixed alongside the other bundle-scoped
-   registry lookups; this repository's containerised gate is the
-   regression home for the class.
-6. **Sibling stateful sinks collided on one OperatorId.** A sink built on
-   the cluster with no uid position-hashed to an id shared by every
-   same-type sink in a same-shaped subtask - which the 2PC sink keys its
-   `PREPARE TRANSACTION` gid and per-checkpoint state on, so five case
-   sinks raced one gid. Found by the 2PC scene; fixed across all three
-   cluster sink-build paths to fall back to the unique spec node id.
-7. **A mid-stream worker kill cascaded to job failure.** Worker-loss
-   recovery relocated only the lost worker's subtasks, leaving survivors
-   running with stale bridges to the moved peers; those "peer gone" send
-   failures each spawned a fresh restart until the budget was gone. Fixed
-   to roll the whole job back to the last checkpoint atomically.
-8. **A checkpointed bounded job with a side-output sink hung forever.**
-   The deepest one, and not 2PC at all: checkpoint barriers never reached
-   side-output channels, so a side-output consumer never acked, and the
-   bounded source's EOS final checkpoint never committed. Two isolation
-   runs (no kill, no Postgres) pinned it. Fixed so barriers and watermarks
-   propagate on every output edge - the Chandy-Lamport requirement.
-9. **`clink replay` was SQL-Row only.** It could not re-execute a custom
-   plugin operator (`cs_event->cs_alert`). Now `register_operator<In,Out>`
-   hangs a type-erased replay driver on the op's factory, so
-   `clink replay --plugin --verify` / `--emit-test` work on custom types;
-   a single-op replay also discards unregistered side-output emits.
-
-The 2PC scene alone surfaced 6, 7 and 8 - a bounded source, checkpointing,
-side outputs and fan-out on a cluster was untested territory until this
-repository drove it. Every fix ships with a regression test in clink.
 
 ## Layout
 
