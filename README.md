@@ -14,7 +14,7 @@ engine. It is a downstream consumer, not part of clink - it installs clink
 into a local prefix and builds against the installed CMake package the way
 any project would.
 
-**Status: round 3 complete.** Embedded detection over the tape,
+**What it demonstrates.** Embedded detection over the tape,
 oracle-gated, with per-pattern harness tests; dynamic rules over broadcast
 state; the per-card risk profile served over clink's queryable-state HTTP
 surface; the five CEP detectors deployed to a real coordinator +
