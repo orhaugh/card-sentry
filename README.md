@@ -161,8 +161,7 @@ OK: killed a worker mid-run; the case table holds exactly the manifest's alerts.
 ```
 
 The file-sink outputs are at-least-once by design and carry post-restore
-duplicates; the exactly-once contract is the case table alone. Getting
-this to pass drove three engine fixes (findings 6-8).
+duplicates; the exactly-once contract is the case table alone.
 
 ## Every alert is evidence
 
@@ -173,8 +172,8 @@ byte-identically, and `--emit-test` freezes it into a self-contained
 regression bundle. For fraud, "why did the detector fire at 09:17" is a
 compliance question; replay makes the answer reproducible and turns the
 incident into a permanent test. The detectors are custom-typed
-(`cs_event->cs_alert`), which needed clink's replay to grow beyond its SQL
-Row path (finding 9).
+(`cs_event->cs_alert`), and replay handles those plugin types, not just SQL
+rows.
 
 ## The upgrade nobody notices
 
