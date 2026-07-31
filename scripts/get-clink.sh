@@ -36,7 +36,7 @@
 
 set -euo pipefail
 
-CLINK_VERSION="${CLINK_VERSION:-v0.4.0}"
+CLINK_VERSION="${CLINK_VERSION:-v0.5.0}"
 CLINK_REPO="${CLINK_REPO:-https://github.com/orhaugh/clink}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

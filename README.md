@@ -25,17 +25,15 @@ to Postgres verified across a hard worker kill mid-run (the case table
 holds exactly the manifest's alerts, no duplicates, no gaps); incident
 replay that freezes a fired alert into a regression bundle; and schema
 evolution of the risk-profile state across a version bump with a
-pre-deploy compatibility gate. The detectors require clink `main` (they
-depend on fixes newer than v0.4.0), so install with `CLINK_SOURCE`
-pointing at a clink checkout; the pin flips to the next release when it
-exists.
+pre-deploy compatibility gate. The detectors require clink
+v0.5.0 or newer, which shipped the CEP timed-out surface and the cluster
+fixes they exercise; `scripts/get-clink.sh` installs it.
 
 ## Quick start
 
 ```bash
-# 1. Install clink into .clink/prefix (from a local checkout, until the
-#    next release ships the CEP fix; afterwards just scripts/get-clink.sh)
-CLINK_SOURCE=~/personal/clink scripts/get-clink.sh
+# 1. Install the pinned clink release into .clink/prefix
+scripts/get-clink.sh
 
 # 2. Generate the tape, build, test, detect, verify - one gate
 scripts/run-detections.sh
@@ -301,8 +299,8 @@ app/tests/schema_evolution_test.cpp   migration + pre-deploy compatibility gate
 ## Pinning
 
 `scripts/get-clink.sh` installs into `.clink/prefix`; nothing touches
-system paths. Release mode clones a pinned tag (currently the v0.4.0
-baseline) and `CLINK_SOURCE=/path/to/clink` installs a local working tree
+system paths. Release mode installs a pinned tag (currently v0.5.0) and
+`CLINK_SOURCE=/path/to/clink` installs a local working tree
 into the identical layout - the consumption seam (installed package + CLI)
 is the same in both modes, so flipping between them changes nothing in
 this repository. The install stamp records the source commit and a
