@@ -21,6 +21,7 @@
 #include <clink/test/one_input_harness.hpp>
 
 #include "events.hpp"
+#include "idempotency.hpp"
 #include "patterns.hpp"
 #include "risk_profile.hpp"
 #include "rules.hpp"
@@ -490,6 +491,101 @@ void test_risk_profile_folds_auths_and_survives_late_arrivals() {
     CHECK(h.output_values().empty());  // the profile op never alerts
 }
 
+void test_idempotency_guard_drops_replays_and_expires_by_event_time() {
+    auto h = clink::test::make_keyed_process_function_harness(
+        cs::IdempotencyGuardFn{std::chrono::hours{1}, std::chrono::seconds{60}},
+        [](const cs::Event& e) { return e.id; });
+    h.open();
+
+    cs::Event a = auth(9001, 12.50, true, T0 + 10'000);
+    a.id = 501;
+    cs::Event b = auth(9001, 7.25, true, T0 + 20'000);
+    b.id = 502;
+    h.process_element(a, a.ts);
+    h.process_element(b, b.ts);
+    // The producer's retry: the same record again, under the same id.
+    h.process_element(a, a.ts);
+    // Same id with a different payload is still the same event: the id is
+    // the identity, not the bytes.
+    cs::Event a_again = a;
+    a_again.amount = 99.00;
+    h.process_element(a_again, a_again.ts);
+
+    const auto out = h.output().records();
+    CHECK(out.size() == 2);
+    if (out.size() == 2) {
+        CHECK(out[0].value.id == 501 && out[1].value.id == 502);
+        // Event time rides through: a guard that stripped it would make
+        // every window and pattern downstream ignore the event.
+        CHECK(out[0].event_time_ms == a.ts);
+        CHECK(out[1].event_time_ms == b.ts);
+    }
+
+    // An id sighted fifty minutes in, for the contrast below.
+    cs::Event c = auth(9001, 3.10, true, T0 + 3'000'000);
+    c.id = 503;
+    h.process_element(c, c.ts);
+    CHECK(h.output_values().size() == 3);
+
+    // Expiry is event time. Once the watermark has moved a TTL past the
+    // first sighting, the id is forgotten and admitted again: the
+    // contract's edge, which a producer's replay horizon must sit inside.
+    h.process_watermark(T0 + 10'000 + 3'600'000 + 1);
+    h.process_element(a, a.ts);
+    CHECK(h.output_values().size() == 4);
+    // ...while an id sighted inside the TTL is still remembered.
+    h.process_element(c, c.ts);
+    CHECK(h.output_values().size() == 4);
+}
+
+// The rail scene's failure shape, in isolation: a batch is seen and
+// checkpointed, later batches follow, the producer re-sends the first
+// batch, the job crashes with the retry in flight and restores from the
+// checkpoint. Every retried id was in the checkpointed seen-set, so the
+// restored guard must drop the whole retry, however the watermark moved.
+void test_idempotency_guard_drops_a_retry_across_a_restore() {
+    constexpr auto kDay = std::int64_t{86'400'000};
+    const auto key_fn = [](const cs::Event& e) { return e.id; };
+    const auto make = [] {
+        return cs::IdempotencyGuardFn{std::chrono::hours{24 * 30}, std::chrono::seconds{60}};
+    };
+    const auto feed = [&](auto& h, std::int64_t first_id, std::int64_t n, std::int64_t t0) {
+        for (std::int64_t i = 0; i < n; ++i) {
+            cs::Event e = auth(1000 + i % 7, 10.0, true, t0 + i * 60'000);
+            e.id = first_id + i;
+            h.process_element(e, e.ts);
+        }
+        h.process_watermark(t0 + (n - 1) * 60'000 - 60'000);
+    };
+
+    auto h = clink::test::make_keyed_process_function_harness(make(), key_fn);
+    h.open();
+    feed(h, 1, 100, T0);                      // batch 0
+    feed(h, 101, 100, T0 + 5 * kDay);         // batch 1
+    CHECK(h.output_values().size() == 200);
+    const auto snap = h.snapshot(7);          // the checkpoint the restore will use
+    feed(h, 201, 100, T0 + 11 * kDay);        // batch 2, after the checkpoint
+    feed(h, 1, 100, T0);                      // the retry of batch 0: dropped
+    CHECK(h.output_values().size() == 300);
+
+    // Crash, restore from the checkpoint, re-read from its cut: batch 2 is
+    // new to this timeline, the retry is not.
+    auto h2 = clink::test::make_keyed_process_function_harness(make(), key_fn);
+    h2.restore_from(snap);
+    h2.open();
+    feed(h2, 201, 100, T0 + 11 * kDay);
+    CHECK(h2.output_values().size() == 100);
+    feed(h2, 1, 100, T0);
+    CHECK(h2.output_values().size() == 100);
+    // And a retry that lands before any new record after the restore, the
+    // rail's exact timing, is dropped as well.
+    auto h3 = clink::test::make_keyed_process_function_harness(make(), key_fn);
+    h3.restore_from(snap);
+    h3.open();
+    feed(h3, 1, 100, T0);
+    CHECK(h3.output_values().empty());
+}
+
 }  // namespace
 
 int main() {
@@ -502,6 +598,8 @@ int main() {
     test_watchlist_effective_dating_and_cap();
     test_watchlist_unsealed_rules_stay_silent();
     test_risk_profile_folds_auths_and_survives_late_arrivals();
+    test_idempotency_guard_drops_replays_and_expires_by_event_time();
+    test_idempotency_guard_drops_a_retry_across_a_restore();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed\n";

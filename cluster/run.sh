@@ -6,15 +6,16 @@
 # scenes).
 #
 # Flow:
-#   1. compose up (clink-runtime image - MUST be built from the same clink
-#      commit the plugin will compile against; the scene compiles the
-#      plugin inside that very image, so they match by construction);
+#   1. compose up (the published clink-runtime image at the pinned release;
+#      the plugin MUST be compiled against the same clink commit the image
+#      runs, and the scene compiles it inside that very image, so they
+#      match by construction);
 #   2. build card_sentry_job.so in-image against the baked SDK;
 #   3. submit with clink_submit_job (also in-image: the submitter dlopens
 #      the Linux .so, which a macOS host cannot);
 #   4. gate out-cluster/alerts-*.ndjson against the manifest.
 #
-#   CLINK_IMAGE=...   override the runtime image (default clink-runtime:latest)
+#   CLINK_IMAGE=...   override the runtime image (default: the published image at the pinned release)
 #   KEEP_UP=1         leave the cluster running after the gate
 #   PAR=n             job parallelism (default 1)
 
@@ -39,7 +40,7 @@ ${COMPOSE} exec -T coordinator bash -c "
     cp /tmp/job-build/card_sentry_job.so /jobs/card_sentry_job.so
 "
 echo "   ABI fingerprint check happens at submit; a mismatch means the image"
-echo "   and checkout are at different clink commits - rebuild the image."
+echo "   and the SDK it bakes disagree, which a published image cannot."
 
 echo "== submitting card-sentry (plugin .so ships to every worker)"
 ${COMPOSE} exec -T \

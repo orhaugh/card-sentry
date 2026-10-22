@@ -1,14 +1,19 @@
 // card-sentry - five CEP fraud detectors plus a dynamic-rules detector
 // over one event tape, in one embedded clink pipeline:
 //
-//   FileSource -> FlatMap(parse) -> WatermarkAssigner
-//     -> fork(6)  (broadcast tee: every branch sees every event + watermark)
+//   FileSource -> FlatMap(parse) -> WatermarkAssigner -> idempotency guard
+//     -> fork(7)  (broadcast tee: every branch sees every event + watermark)
 //         -> filter -> CepOperator(card_testing)      \
 //         -> filter -> CepOperator(impossible_travel)  |
 //         -> filter -> CepOperator(account_takeover)   | union -> render
 //         -> filter -> CepOperator(otp_never_verified) |   -> FileSink
 //         -> filter -> CepOperator(structuring)        |
 //         -> filter -> broadcast_process(watchlist) <- + <- rules FileSource
+//
+// The idempotency guard (idempotency.hpp) sits between the watermark
+// assigner and the fan-out: a record whose id has already been seen is
+// dropped once, before any detector can count it twice. The tape itself
+// carries no duplicates; the payment-rail scene's producer does.
 //
 // The watchlist detector joins the auth branch with a SECOND stream of
 // effective-dated merchant rules through broadcast state (see
@@ -55,6 +60,7 @@
 #include <clink/time/watermark_strategy.hpp>
 
 #include "events.hpp"
+#include "idempotency.hpp"
 #include "patterns.hpp"
 #include "risk_profile.hpp"
 #include "rules.hpp"
@@ -131,7 +137,16 @@ int main(int argc, char** argv) {
     auto h_parsed = dag.add_operator<std::string, cs::Event>(h_src, parse);
     auto h_timed = dag.add_operator<cs::Event, cs::Event>(h_parsed, assigner);
 
-    auto branches = dag.fork<cs::Event>(h_timed, 7);
+    // The idempotency guard: keyed by event id, the seen-set in keyed state
+    // under an event-time TTL. Stateful, so it carries a uid.
+    auto guard = std::make_shared<
+        detail::KeyedProcessFunctionAdapter<std::int64_t, cs::Event, cs::Event>>(
+        std::make_shared<cs::IdempotencyGuardFn>(), [](const cs::Event& e) { return e.id; },
+        nullptr, "idempotency_guard");
+    guard->set_uid("cs-idempotency-guard");
+    auto h_guarded = dag.add_operator<cs::Event, cs::Event>(h_timed, guard);
+
+    auto branches = dag.fork<cs::Event>(h_guarded, 7);
     clink::queryable_state::Registry state_registry;
 
     std::vector<StageHandle<cs::Alert>> alert_streams;

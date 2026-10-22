@@ -49,6 +49,10 @@ Noise invariants (what makes the oracle exact):
 Any alert on a non-campaign entity is therefore a detector or engine bug,
 and the checker treats it as a failure.
 
+Campaign placement scales with --days: each campaign sits at a fixed
+fraction of the tape, so a 90-day tape has the same campaigns as the 3-day
+one, spread over 90 days of noise.
+
 Usage:
     tools/csgen.py [--seed 7] [--days 3] [--out data]
 """
@@ -374,7 +378,12 @@ def main():
     for i in range(args.accounts):
         gen_account_noise(rng, tape, 2_000 + i, span_ms)
 
-    day = 86_400_000
+    # Campaigns sit at fixed FRACTIONS of the tape (thirds of it, so a 3-day
+    # tape places them on their day). A longer tape spreads them across its
+    # whole length instead of bunching them into its first three days, which
+    # is what lets a kill-mid-flight scene see alerts commit on both sides of
+    # the failure. The 3-day tape is byte-for-byte unchanged.
+    day = span_ms // 3
     rules = []
     campaigns = [
         c_card_testing(rng, tape, 9_001, BASE_TS + int(0.4 * day)),

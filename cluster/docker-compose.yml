@@ -1,42 +1,63 @@
-# card-sentry distributed scene: one clink Coordinator and two Workers
+# card-sentry distributed scenes: one clink Coordinator and two Workers
 # running the SAME five detectors as the embedded app, packaged as a
 # compiled job plugin (.so) and shipped to every worker at submit.
 #
-# The image must be a clink-runtime built from the SAME clink commit the
-# plugin is compiled against (the ABI gate compares git SHAs). The scene
-# builds the plugin INSIDE this image - it bakes the SDK - so both sides
-# match by construction.
+# The image is the published clink runtime at the release this repository
+# pins. A job .so must be built against the SAME clink commit the image runs
+# (the ABI gate compares fingerprints at submit), so every scene builds the
+# plugin INSIDE this image, which bakes the SDK: both sides match by
+# construction. CLINK_IMAGE overrides the image, for one built locally.
 #
-#   cluster/run.sh               # builds the .so in-image, submits, gates
-#   open http://localhost:8081   # coordinator dashboard while it runs
+#   cluster/run.sh        the detectors on the cluster, gated
+#   cluster/run-2pc.sh    bounded tape, Postgres 2PC, worker killed mid-run
+#   cluster/run-rail.sh   Kafka in, Postgres + Kafka out, worker killed
+#                         mid-flight, read_committed verification (starts
+#                         the `rail` profile below for the broker)
+#   cluster/replay.sh     capture -> replay --verify -> --emit-test
+#   open http://localhost:8081   coordinator dashboard while a scene runs
 #
-# Volumes: the tape is read-only under /data on both workers (the source
-# subtask may land on either); alert sinks write to the shared ./out-cluster
-# mount; ./cluster/jobs carries the freshly built plugin to the submitter.
+# Volumes: the tapes are read-only under /data on both workers (the source
+# subtask may land on either) and the rail feed under /tape on the broker
+# (that scene's producer runs inside it); alert sinks write to the shared
+# ./out-cluster mount; ./cluster/jobs carries the freshly built plugin to
+# the submitter; ./cluster/ckpt is the shared checkpoint root; ./cluster/trace
+# receives every process's protocol trace when CS_TRACE_DIR=/trace is
+# exported (run-rail.sh TRACE=1), and nothing otherwise.
+
+x-clink-env: &clink-env
+  CLINK_DATA_BIND_HOST: 0.0.0.0
+  CLINK_PROTOCOL_TRACE_DIR: ${CS_TRACE_DIR:-}
 
 services:
   coordinator:
-    image: ${CLINK_IMAGE:-clink-runtime:latest}
-    command: >
-      clink_node --role=coordinator --port=6123
-                 --bind-host=0.0.0.0 --advertise-host=coordinator
-                 --http-port=8081 --http-bind=0.0.0.0
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.11.0}
+    # The image's entrypoint runs clink_node for a flag-first command (and
+    # the `clink` CLI for a subcommand), so the daemon's flags come bare.
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=coordinator
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+    environment: *clink-env
     ports:
       - "8081:8081"   # dashboard + HTTP API
     volumes:
       - ..:/mnt/card-sentry:ro   # consumer checkout (in-image plugin build)
       - ./jobs:/jobs             # built .so lands here for the submitter
-      - ./ckpt:/ckpt             # shared checkpoint root (2PC scene)
+      - ./ckpt:/ckpt             # shared checkpoint root (2PC + rail scenes)
       - ./capture:/capture       # shared flight-recorder root (replay scene)
+      - ./trace:/trace           # protocol trace (rail scene, TRACE=1)
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/api/v1/health >/dev/null"]
       interval: 3s
       timeout: 5s
       retries: 30
 
-  # The 2PC scene's case store. max_prepared_transactions > 0 is the
-  # server-side requirement of PREPARE TRANSACTION / COMMIT PREPARED,
-  # which is what clink's exactly-once postgres sink is built on.
+  # The case store. max_prepared_transactions > 0 is the server-side
+  # requirement of PREPARE TRANSACTION / COMMIT PREPARED, which is what
+  # clink's exactly-once postgres sink is built on.
   postgres:
     image: postgres:16
     command: postgres -c max_prepared_transactions=32
@@ -50,37 +71,73 @@ services:
       timeout: 5s
       retries: 30
 
-  worker1:
-    image: ${CLINK_IMAGE:-clink-runtime:latest}
-    command: >
-      clink_node --role=worker --id=worker-1
-                 --coordinator-host=coordinator --coordinator-port=6123
-                 --data-host=worker1 --slots=40
+  # The rail scene's broker: a single-node KRaft Kafka, reachable inside
+  # this network as kafka:9092. Transactions need the transaction-state
+  # topic; with one broker its replication factor and min ISR are 1. Topics
+  # are created explicitly by the scene, so a typo fails loudly instead of
+  # auto-creating a stray topic.
+  kafka:
+    image: apache/kafka:3.9.1
+    profiles: ["rail"]
     environment:
-      CLINK_DATA_BIND_HOST: 0.0.0.0
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - ../data-rail:/tape:ro    # the producer reads the feed from here
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 10s
+
+  worker1:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.11.0}
+    command:
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker1
+      - --slots=40
+    environment: *clink-env
     volumes:
       - ../data:/data:ro
       - ../out-cluster:/out
       - ./ckpt:/ckpt
       - ./capture:/capture
+      - ./trace:/trace
     depends_on:
       coordinator:
         condition: service_healthy
     restart: on-failure
 
   worker2:
-    image: ${CLINK_IMAGE:-clink-runtime:latest}
-    command: >
-      clink_node --role=worker --id=worker-2
-                 --coordinator-host=coordinator --coordinator-port=6123
-                 --data-host=worker2 --slots=40
-    environment:
-      CLINK_DATA_BIND_HOST: 0.0.0.0
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.11.0}
+    command:
+      - --role=worker
+      - --id=worker-2
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker2
+      - --slots=40
+    environment: *clink-env
     volumes:
       - ../data:/data:ro
       - ../out-cluster:/out
       - ./ckpt:/ckpt
       - ./capture:/capture
+      - ./trace:/trace
     depends_on:
       coordinator:
         condition: service_healthy

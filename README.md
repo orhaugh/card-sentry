@@ -1,31 +1,48 @@
 # card-sentry
 
 Card-fraud detection built on [clink](https://github.com/orhaugh/clink)'s
-CEP engine. One deterministic synthetic tape of card payments and account
+CEP engine, and a worked example of exactly-once transaction processing
+around it. One deterministic synthetic tape of card payments and account
 activity with labelled fraud campaigns injected, five detectors written
-against the native `clink::cep` pattern DSL, and an oracle that gates the
+against the native `clink::cep` pattern DSL, and an oracle that gates every
 run exactly: every expected alert fired, every negative control stayed
 quiet, zero false positives.
 
 Where [market-pulse](https://github.com/orhaugh/market-pulse) is analytics
 on a tape (windows, joins, aggregations), card-sentry is detection and
 response: sequences, absences, timeouts and dynamic response over the same
-engine. It is a downstream consumer, not part of clink - it installs clink
+engine, and then the delivery of what it detects into the systems that act
+on it. It is a downstream consumer, not part of clink - it installs clink
 into a local prefix and builds against the installed CMake package the way
 any project would.
 
-**What it demonstrates.** Embedded detection over the tape,
-oracle-gated, with per-pattern harness tests; dynamic rules over broadcast
-state; the per-card risk profile served over clink's queryable-state HTTP
-surface; the five CEP detectors deployed to a real coordinator +
-two-worker cluster as a compiled job plugin; exactly-once alert delivery
-to Postgres verified across a hard worker kill mid-run (the case table
-holds exactly the manifest's alerts, no duplicates, no gaps); incident
-replay that freezes a fired alert into a regression bundle; and schema
-evolution of the risk-profile state across a version bump with a
-pre-deploy compatibility gate. The detectors require clink
-v0.5.0 or newer, which shipped the CEP timed-out surface and the cluster
-fixes they exercise; `scripts/get-clink.sh` installs it.
+**What it demonstrates.**
+
+- Embedded detection over the tape, oracle-gated, with per-pattern harness
+  tests; dynamic rules over broadcast state; the per-card risk profile
+  served over clink's queryable-state HTTP surface.
+- The five detectors deployed to a real coordinator and two-worker cluster
+  as a compiled job plugin, running the published runtime image.
+- **The payment rail**: Kafka in, Postgres and Kafka out under one
+  checkpoint, an at-least-once producer that re-sends a batch, and a worker
+  killed mid-flight. The case table and the `read_committed` alerts topic
+  end holding exactly the manifest's alerts.
+- An idempotency guard in front of the detectors, with its negative control:
+  exactly-once delivery does not dedupe the input, and the scene shows what
+  happens without the guard.
+- The recorded run handed to clink's exactly-once specification: the
+  protocol steps the engine took under the kill, followed by the TLA+
+  model's checker, which names exactly where its coverage ends (an
+  interval in which a sink stages nothing, which this feed produces almost
+  every second).
+- Incident replay that freezes a fired alert into a regression bundle, and
+  schema evolution of the risk-profile state across a version bump with a
+  pre-deploy compatibility gate.
+
+How the guarantees fit together, stage by stage and with their limits, is
+written up in [docs/exactly-once-in-practice.md](docs/exactly-once-in-practice.md).
+The repository pins clink v0.11.0; `scripts/get-clink.sh` installs it, and
+the cluster scenes pull the matching published runtime image.
 
 ## Quick start
 
@@ -60,7 +77,9 @@ window's edge, two band transfers that never reach the structuring
 threshold). Noise is generated under invariants that keep it provably
 clear of every decision boundary (documented in the generator), so any
 alert outside the manifest is a detector or engine bug, and the checker
-fails the run.
+fails the run. A longer tape (`--days 90`, which the cluster scenes use)
+carries the same campaigns spread across its whole length, inside ninety
+days of noise.
 
 ## The five detectors
 
@@ -77,14 +96,15 @@ Each detector exercises a distinct part of the pattern DSL
 | `watchlist_hit` / `cap_exceeded` | Auths at merchants on a watchlist, or over a per-merchant cap, where the rules arrive on a SECOND stream and change mid-tape without a redeploy | **Broadcast state** (`BroadcastProcessFunction`): effective-dated rules make outcomes depend only on event times, an `end_of_rules` marker seals the set, and a bootstrap buffer keeps early auths from outrunning the rules |
 
 All detectors run in one embedded pipeline (`app/src/card_sentry.cpp`),
-alongside a per-card risk profile that emits nothing and instead serves
-its keyed state over HTTP (next section):
+behind the idempotency guard and alongside a per-card risk profile that
+emits nothing and instead serves its keyed state over HTTP (next section):
 
 ```mermaid
 graph LR
   A["FileSource events"] --> B["FlatMap parse"]
   B --> C["WatermarkAssigner<br/>bounded 60 s"]
-  C --> D["fork x7<br/>broadcast tee"]
+  C --> G["idempotency guard<br/>seen ids, event-time TTL"]
+  G --> D["fork x7<br/>broadcast tee"]
   D --> E1["5x CepOperator<br/>patterns above"]
   D --> E6["watchlist<br/>broadcast_process"]
   R["FileSource rules"] --> RP["FlatMap parse"]
@@ -123,15 +143,26 @@ compiled job plugin (`CLINK_REGISTER_JOB`), sharing the pattern builders
 and alert selectors in `patterns.hpp` with the embedded pipeline - the
 two deployments cannot drift. Inline CEP lambdas are in-process-only on
 the plain fluent path; packaging them as a plugin is exactly what makes
-them cluster-runnable, so the constraint becomes the demonstration.
+them cluster-runnable, so the constraint becomes the demonstration. One
+rule follows from that model: `define_job` runs in every process that
+loads the plugin, the submitter and then each worker, so anything an
+operator needs at run time has to travel in the spec as a parameter, and
+the graph's shape must not depend on the environment at all. A value
+captured from the environment at define time is whatever that process's
+environment says, which is how the guard's TTL first failed to reach the
+workers; a graph that gains or loses an operator by environment renumbers
+the inline operators, which is how the first negative control was refused
+at planning. The guard is therefore always in the graph, with its TTL and
+its on/off switch as parameters.
 
-`cluster/run.sh` brings up a coordinator and two workers (compose),
-compiles the plugin INSIDE the runtime image - a job `.so` must be built
-on the workers' platform against the same clink commit, and the image
-bakes the SDK precisely so both are guaranteed - submits it with
-`clink_submit_job` (also in-image: the submitter dlopens the Linux
-`.so`), and gates `out-cluster/alerts-*.ndjson` against the manifest
-restricted to the five shipped patterns:
+`cluster/run.sh` brings up a coordinator and two workers (compose, on the
+published `clink-runtime` image at the pinned release), compiles the
+plugin INSIDE that image - a job `.so` must be built on the workers'
+platform against the same clink commit, and the image bakes the SDK
+precisely so both are guaranteed - submits it with `clink_submit_job` (also
+in-image: the submitter dlopens the Linux `.so`), and gates
+`out-cluster/alerts-*.ndjson` against the manifest restricted to the five
+shipped patterns:
 
 ```
 submit: name=card-sentry completed=1 ok=1
@@ -144,24 +175,189 @@ to end: through the spec, the planner's chains, and the workers' network
 channels. The dashboard is live at http://localhost:8081 during the run
 (`KEEP_UP=1` leaves it up).
 
+## The payment rail: Kafka in, two stores out, a worker killed mid-flight
+
+`cluster/run-rail.sh` is the transaction-processing scene. The detectors
+read a Kafka topic instead of a file, and every alert lands in two places
+under one checkpoint: the Postgres case table through clink's two-phase
+commit sink (`PREPARE TRANSACTION` at the barrier, `COMMIT PREPARED` when
+the checkpoint is globally durable) and a Kafka alerts topic inside a
+broker transaction that commits with the same checkpoint. The feed arrives
+the way a rail delivers it: in batches, from an at-least-once producer
+that re-sends one batch it had already delivered. Once the case table
+shows alerts committing and batches are still to come, a worker is killed
+`-9`; the coordinator rolls the job back to its last checkpoint and
+redeploys, the Kafka source resumes from its checkpointed offsets, and the
+remaining batches are detected by the redeployed job.
+
+```mermaid
+graph LR
+  P["producer<br/>batches, one re-sent"] --> T["kafka<br/>payments.events"]
+  T --> S["kafka source<br/>offsets in the checkpoint"]
+  S --> G["idempotency guard"]
+  G --> D["5 detectors"]
+  D --> PG["postgres 2PC<br/>case table"]
+  D --> K["kafka 2PC<br/>fraud.alerts"]
+  D --> F["file sinks<br/>at-least-once diagnostics"]
+```
+
+The gates read the stores from outside the engine: the case table with
+`psql`, the topic with the broker's console consumer at
+`isolation.level=read_committed`:
+
+```
+== submitting: kafka source, idempotency guard ON (TTL 30 days of event time), postgres 2PC + kafka 2PC sinks, checkpoints every 1000 ms
+job 1 accepted and RUNNING (24 subtasks); the submit's completion wait was not waited for - a topic has no end
+== producing the feed in 16 batches; batch 2 is re-sent after batch 3
+   batch 2 produced; case table: 0 alert(s) committed
+   batch 2 re-sent: the producer timed out on its ack and retried
+   batch 3 produced; case table: 4 alert(s) committed
+== killing worker2 -9 now: 4 alerts committed, 12 batches still to come
+   coordinator: worker lost: worker-2 (heartbeat timeout)
+   coordinator: restore point: checkpoint 20 (latest_completed=20 latest_confirmed=20 tracked=5)
+   worker2 killed; compose restarts it, the coordinator rolled the job back to that checkpoint and redeployed on the survivor
+   batch 4 produced; case table: 4 alert(s) committed
+   ...
+   batch 15 produced; case table: 9 alert(s) committed
+== gate 1: the case table against the manifest (exactly-once into postgres)
+alerts: 9 written, 9 expected
+OK: every expected alert fired, every control stayed quiet, zero false positives.
+== gate 2: the alerts topic, read_committed, against the manifest (exactly-once into kafka)
+alerts: 9 written, 9 expected
+OK: every expected alert fired, every control stayed quiet, zero false positives.
+alerts topic: 9 records on the log, 9 visible to a read_committed consumer
+events topic: 845745 records for 795995 distinct events (49750 duplicates from the retried batch)
+== verdict
+OK: a worker died mid-flight and a batch was delivered twice; the case table and the
+    read_committed alerts topic both hold exactly the manifest's alerts.
+```
+
+When the kill catches an interval in flight, the same consumer at
+`read_uncommitted` also shows the records the aborted transaction left on
+the log, which a transactional consumer never sees; one run recorded here
+had eleven records on the log and ten visible. `GUARD_DEBUG=1` adds the
+guard's own account from the worker log: the restored incarnation opens
+with `199000 entries restored`, the ids of the four batches already seen,
+which is the keyed state the restore brought back. The file-sink outputs
+are at-least-once by design; the coordinator says so when it labels the
+job's delivery guarantee by its weakest sink. The exactly-once contract is
+the two stores the gates read.
+
+Two sinks commit on the same per-checkpoint decision, and there is no
+cross-sink atomic commit: a crash between the two commits is healed by
+recovery, so for a completed checkpoint both stores end holding the
+interval. The design note spells out why "both end committed" is the
+honest claim and "atomic" is not.
+
+## Idempotency is not exactly-once
+
+The producer re-sends a batch; every record in it is on the topic twice
+under the same id. Exactly-once processing guarantees that each of those
+records affects the output exactly once, which is twice. The guard in
+front of the detectors (`app/src/idempotency.hpp`) is where the domain
+knowledge enters: two records with one id are one event. Its seen-set is
+keyed state under an event-time TTL, checkpointed with everything else, so
+a restore meets the same answers. The TTL is the declared edge: a producer
+whose replay horizon is a day needs a day-long TTL.
+
+`GUARD=0 cluster/run-rail.sh` is the negative control. With the guard
+switched to pass-through the re-sent batch reaches the detectors twice -
+the same probes and strike match again, a second OTP request times out -
+and the oracle fails, which the script expects. `GUARD_TTL_DAYS=1` is the
+horizon control: the tape compresses ninety days into seconds, one batch
+is 5.6 days of event time, and a day-long TTL has forgotten the batch's
+ids by the time it is re-sent, so the oracle fails the same way. The scene
+runs with a 30-day TTL because that is the horizon this producer has.
+
+```
+== submitting: kafka source, idempotency guard OFF, postgres 2PC + kafka 2PC sinks, checkpoints every 1000 ms
+...
+== gate 1: the case table against the manifest (exactly-once into postgres)
+alerts: 11 written, 9 expected
+FAIL (4):
+  - expected 1 alert(s) for ('card_testing', 'card', 9001), got 2
+  - expected 1 alert(s) for ('otp_never_verified', 'account', 8101), got 2
+  - unexpected alert x1: ('card_testing', 'card', 9001) (noise must never alert)
+  - unexpected alert x1: ('otp_never_verified', 'account', 8101) (noise must never alert)
+== gate 2: the alerts topic, read_committed, against the manifest (exactly-once into kafka)
+alerts: 11 written, 9 expected
+FAIL (4): (the same four)
+alerts topic: 11 records on the log, 11 visible to a read_committed consumer
+== verdict
+OK (negative control): without the idempotency guard the retried batch reached the detectors
+    twice and the oracle failed, as it must. Exactly-once delivery did not, and cannot, dedupe the input.
+```
+
+The two stores still agree with each other to the row: the engine
+delivered every detector emission exactly once. The duplication is in the
+input, and only the domain's idempotency key can see it.
+
+## The run, checked against the protocol's specification
+
+clink ships its exactly-once protocol as a TLA+ specification that the
+model checker verifies in its CI, and every clink process can record the
+protocol steps it takes. `TRACE=1 KAFKA_ALERTS=0 cluster/run-rail.sh`
+records the rail run - barriers delivered, transactions prepared,
+checkpoints completed, commits delivered, the worker lost, the job
+redeployed - and `cluster/validate-trace.sh` has TLC follow that record
+through the specification. The run is accepted only if some path through
+the model produces every recorded step in order; otherwise the first step
+no rule allows is named. The specification's trace module models one sink
+family per job, the Kafka family with its receipts and confirmations or
+the recoverable family Postgres belongs to, so the traced run keeps the
+case table as its one exactly-once store; the mixed run above is judged by
+its gates, and the validator refuses a mixed trace rather than guessing.
+
+```
+trace: 2982 protocol events from 3 process files
+   SubtaskAck x1202
+   SinkConfirm x756
+   SinkPrepare x315
+   DeliverCommit x315
+   Trigger x68
+   DeliverBarrier x68
+   WriteCompleted x63
+   CoordComplete x63
+   Broadcast x63
+   Placement x38
+   SubtaskDrained x10
+   SinkOpens x10
+   SinkCommit x9
+   WorkerDies x1
+   Redeploy x1
+formal-check: TLC trace/trace (2982 events)
+formal-check:   DIVERGES after 1s at event 54: {"seq":30,"ts":1792685352395602,"proc":"worker:1","event":"DeliverCommit","sub":10,"ckpt":1,"accepted":false}
+formal-check:   no step of the specification produces this event from any state the trace reached
+```
+
+The checker stops at the first commit a sink declined, and that is the
+honest result at clink v0.11.0: the specification models every prepare as
+staging a transaction, and this feed is nine alerts in ninety days, so in
+most intervals a sink receives nothing, stages nothing and declines the
+commit with nothing to do. clink's own traced workloads carry records in
+every interval and never produced that step; a fraud feed produces it
+every second. Nine commits out of 315 deliveries did stage and commit, the
+worker loss and the redeploy are in the record, and the gates hold. The
+model's coverage ends at empty intervals; extending the specification to
+them is work in the engine, and the scene reports the verdict rather than
+hiding it. Which is what a specification is for: when the run and the
+model disagree, one of them is wrong, and the checker names the exact step
+to look at.
+
 ## Kill the detector, the case table doesn't lie
 
-`cluster/run-2pc.sh` adds an exactly-once Postgres case store: every alert
-also lands through clink's two-phase-commit sink (`PREPARE TRANSACTION` at
-the barrier, `COMMIT PREPARED` when the checkpoint is globally durable).
-Mid-run it `kill -9`s a worker; the coordinator rolls the whole job back
-to the last checkpoint, redeploys on the survivor, and the case table ends
-holding **exactly** the manifest's alerts - no duplicates from the replay,
-no gaps from the crash:
+`cluster/run-2pc.sh` is the bounded variant: the ninety-day tape read from
+a file, the Postgres case store, a worker killed `-9` mid-run. The
+coordinator rolls the whole job back to the last checkpoint, redeploys on
+the survivor, the source rewinds to its snapshotted offset, and the job's
+final checkpoint commits the tail; the case table ends holding **exactly**
+the manifest's alerts:
 
 ```
 == killing worker2 mid-run
 case table: 9 rows, expected 9
 OK: killed a worker mid-run; the case table holds exactly the manifest's alerts.
 ```
-
-The file-sink outputs are at-least-once by design and carry post-restore
-duplicates; the exactly-once contract is the case table alone.
 
 ## Every alert is evidence
 
@@ -192,11 +388,15 @@ Three independent gates, all run by `scripts/run-detections.sh`:
 1. **Harness tests** (`app/tests/patterns_test.cpp`): each detector driven
    through clink's public testing framework with explicit event times and
    watermarks - match, non-match, negation, timeout and skip behaviour
-   pinned per pattern, plus a codec round-trip.
+   pinned per pattern, plus a codec round-trip and the idempotency guard's
+   drop-and-expire contract.
 2. **The oracle** (`tools/check.py`): the tape run's alerts against the
    manifest - exact multiset equality on the expected alerts, silence from
    every negative control, and zero alerts anywhere else.
 3. **Determinism**: same tape, same alert set, every run.
+
+The cluster scenes reuse the same oracle over what they read back from the
+stores: the case table rendered as JSON rows, the alerts topic as consumed.
 
 ## Layout
 
@@ -205,32 +405,41 @@ scripts/get-clink.sh            install clink (release tag, or CLINK_SOURCE=<che
 scripts/run-detections.sh       generate -> build -> test -> detect -> verify
 scripts/scene-risk-lookup.sh    queryable-state scene: served profiles vs the tape
 cluster/run.sh                  cluster scene: in-image plugin build -> submit -> gate
-cluster/run-2pc.sh              2PC exactly-once + kill-a-worker; NO_KILL / NO_PG switches
+cluster/run-rail.sh             payment rail: kafka in, postgres + kafka 2PC out, worker kill;
+                                GUARD=0 negative control, TRACE=1 specification check
+cluster/validate-trace.sh       a recorded run against clink's exactly-once specification
+cluster/run-2pc.sh              bounded tape, Postgres 2PC + kill-a-worker; NO_KILL / NO_PG switches
 cluster/replay.sh               capture -> replay --verify -> --emit-test bundle
-cluster/docker-compose.yml      coordinator + two workers + postgres
+cluster/docker-compose.yml      coordinator + two workers + postgres (+ kafka under the rail profile)
+docs/exactly-once-in-practice.md  the guarantees, stage by stage, and where they stop
 tools/csgen.py                  deterministic tape + rules + manifest generator
+tools/railfeed.py               the tape as producer batches, one of them re-sent
 tools/check.py                  the oracle (--only-patterns for subset deployments)
 app/src/events.hpp              event model, parser, codecs, haversine, alerts
+app/src/idempotency.hpp         the idempotency guard (keyed seen-set, event-time TTL)
 app/src/patterns.hpp            shared pattern builders + alert selectors
 app/src/rules.hpp               effective-dated rule model + codec
 app/src/watchlist.hpp           broadcast-state watchlist detector
 app/src/risk_profile.hpp        per-card profile + queryable-state binding
 app/src/risk_profile_v2.hpp     the evolved profile (v2) + the v1->v2 migration
 app/src/card_sentry.cpp         the embedded pipeline
-app/src/card_sentry_job.cpp     the same detectors as a job plugin (.so)
-app/tests/patterns_test.cpp     harness tests per detector
+app/src/card_sentry_job.cpp     the same detectors as a job plugin (.so); file or kafka source
+app/tests/patterns_test.cpp     harness tests per detector + the guard
 app/tests/schema_evolution_test.cpp   migration + pre-deploy compatibility gate
 ```
 
 ## Pinning
 
 `scripts/get-clink.sh` installs into `.clink/prefix`; nothing touches
-system paths. Release mode installs a pinned tag (currently v0.5.0) and
+system paths. Release mode installs a pinned tag (currently v0.11.0) and
 `CLINK_SOURCE=/path/to/clink` installs a local working tree
 into the identical layout - the consumption seam (installed package + CLI)
 is the same in both modes, so flipping between them changes nothing in
 this repository. The install stamp records the source commit and a
-`-dirty` marker; a dirty tree always reinstalls.
+`-dirty` marker; a dirty tree always reinstalls. The cluster scenes run
+the published `ghcr.io/orhaugh/clink-runtime` image at the same release
+and build the job plugin inside it, so the plugin and the engine agree by
+construction; `CLINK_IMAGE` points them at a locally built image instead.
 
 ## Licence
 

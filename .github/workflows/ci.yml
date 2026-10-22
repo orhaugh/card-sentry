@@ -7,12 +7,12 @@
 # clink is pinned to a tagged release (CLINK_VERSION below). On the Linux
 # x86_64 runner get-clink.sh takes the prebuilt-SDK fast path: it downloads
 # the release's SDK tarball, verifies its checksum and extracts it, with no
-# compiler for clink itself. The detectors' engine fixes (the CEP timed-out
-# surface, the EOS final-checkpoint fix for side-output sinks, plugin-typed
-# replay, ...) shipped in v0.5.0.
+# compiler for clink itself. The detectors need v0.5.0 or newer (the CEP
+# timed-out surface and the cluster fixes they exercise); the pin follows
+# the current release.
 #
-# The cluster scenes (cluster/run.sh, run-2pc.sh, replay.sh) need Docker and
-# a runtime-image build; they run locally, not here.
+# The cluster scenes (cluster/run.sh, run-2pc.sh, run-rail.sh, replay.sh)
+# need Docker and the published runtime image; they run locally, not here.
 
 name: ci
 
@@ -24,7 +24,7 @@ on:
 
 env:
   # The tagged clink release the detectors build against.
-  CLINK_VERSION: v0.5.0
+  CLINK_VERSION: v0.11.0
   # No object-store Arrow (nothing here uses s3://): lets the pinned
   # toolchain build on a bare runner without the aws-sdk at /usr/local.
   CLINK_ARROW_OBJECT_STORES: "OFF"
