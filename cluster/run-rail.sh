@@ -368,7 +368,9 @@ else
 fi
 
 if [[ "${TRACE}" == "1" ]]; then
-    say "the recorded run against the exactly-once specification"
+    # Keep the run's trace where the next scene's start-up wipe cannot reach it.
+    rm -rf out-cluster/rail-trace && cp -R cluster/trace out-cluster/rail-trace
+    say "the recorded run against the exactly-once specification (copy kept under out-cluster/rail-trace)"
     # Reported, not gated: the gates above are the scene's verdict. At clink
     # v0.11.0 the specification models every prepare as staging a
     # transaction, so a sink that received nothing in an interval (most

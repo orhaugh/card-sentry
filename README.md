@@ -32,9 +32,10 @@ any project would.
   happens without the guard.
 - The recorded run handed to clink's exactly-once specification: the
   protocol steps the engine took under the kill, followed by the TLA+
-  model's checker, which names exactly where its coverage ends (an
-  interval in which a sink stages nothing, which this feed produces almost
-  every second).
+  model's checker. The first such run found the model's edge (an interval
+  in which a sink stages nothing, which this feed produces almost every
+  second); the specification was extended for it, and the run is accepted
+  by the extended model and recorded among clink's validated traces.
 - Incident replay that freezes a fired alert into a regression bundle, and
   schema evolution of the risk-profile state across a version bump with a
   pre-deploy compatibility gate.
@@ -331,18 +332,28 @@ formal-check:   no step of the specification produces this event from any state 
 ```
 
 The checker stops at the first commit a sink declined, and that is the
-honest result at clink v0.11.0: the specification models every prepare as
-staging a transaction, and this feed is nine alerts in ninety days, so in
-most intervals a sink receives nothing, stages nothing and declines the
-commit with nothing to do. clink's own traced workloads carry records in
-every interval and never produced that step; a fraud feed produces it
-every second. Nine commits out of 315 deliveries did stage and commit, the
-worker loss and the redeploy are in the record, and the gates hold. The
-model's coverage ends at empty intervals; extending the specification to
-them is work in the engine, and the scene reports the verdict rather than
-hiding it. Which is what a specification is for: when the run and the
-model disagree, one of them is wrong, and the checker names the exact step
-to look at.
+honest result against clink v0.11.0's specification: it modelled every
+prepare as staging a transaction, and this feed is nine alerts in ninety
+days, so in most intervals a sink receives nothing, stages nothing and
+declines the commit with nothing to do. clink's own traced workloads carry
+records in every interval and never produced that step; a fraud feed
+produces it every second. Which is what a specification is for: when the
+run and the model disagree, one of them is wrong, and the checker names the
+exact step to look at. The specification was then extended on clink main
+(an empty prepare that stages nothing, a ghost fixing a position's answer
+across a replay, invariants that ask nothing of a sink at an interval it
+found empty), and against that checker the same kind of run is accepted:
+
+```
+formal-check: TLC trace/rail-trace (4281 events)
+formal-check:   accepted in 9s: every event is a step the specification allows
+```
+
+That run (455 prepares, 9 of them staged, a worker lost and the job
+redeployed) is now one of the recorded traces clink validates on every
+push. `CLINK_SPEC_SOURCE=/path/to/clink cluster/validate-trace.sh
+cluster/trace` runs the check with a checkout newer than the pinned
+release; the pin follows the next release.
 
 ## Kill the detector, the case table doesn't lie
 

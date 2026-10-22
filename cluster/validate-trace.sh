@@ -20,14 +20,17 @@
 # Needs a Java 11+ runtime (TLC) and the clink source at the pinned release
 # for formal/ and the validation script. scripts/get-clink.sh leaves that
 # source under .clink/src when it built from source; otherwise this script
-# fetches just those two directories at the pinned tag.
+# fetches just those two directories at the pinned tag. CLINK_SPEC_SOURCE
+# names another clink checkout to take the specification from, for a model
+# newer than the pinned release's: the empty-interval extension this scene
+# prompted landed on clink main after v0.11.0.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRACE_DIR="$(cd "${1:-${ROOT}/cluster/trace}" && pwd)"
 CLINK_VERSION="${CLINK_VERSION:-$(grep -o 'CLINK_VERSION:-v[0-9.]*' "${ROOT}/scripts/get-clink.sh" | head -1 | cut -d- -f2)}"
 CLINK_REPO="${CLINK_REPO:-https://github.com/orhaugh/clink}"
-SRC="${ROOT}/.clink/src"
+SRC="${CLINK_SPEC_SOURCE:-${ROOT}/.clink/src}"
 
 if ! command -v java >/dev/null 2>&1; then
     echo "validate-trace: java not found - TLC needs a Java 11+ runtime" >&2

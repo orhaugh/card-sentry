@@ -209,11 +209,14 @@ the graph and is switched off by a parameter.
   the mixed job was refused at its first Postgres prepare. And the
   specification models every prepare as staging a transaction, so a sink
   that received nothing in an interval and declined its commit is the first
-  step the checker cannot explain. clink's own traced workloads never
+  step the checker could not explain. clink's own traced workloads never
   produce that step; a feed with nine alerts in ninety days produces it in
-  almost every interval. The verdict is reported as it is. Extending the
-  specification to empty intervals is work in the engine, and finding the
-  edge with a realistic workload is what the showcase is for.
+  almost every interval. The specification was extended for it on clink
+  main, the same run is accepted by the extended model (4,281 events, every
+  one a step the protocol allows) and recorded among the traces clink
+  validates on every push, and the scene still reports the verdict of
+  whichever checker it is given. Finding the edge with a realistic workload
+  is what the showcase is for.
 - `cluster/replay.sh` is the forensic side of the same discipline: the
   flight recorder captures what each operator consumed per checkpoint
   epoch, and an alert can be re-derived offline, byte for byte, and frozen
