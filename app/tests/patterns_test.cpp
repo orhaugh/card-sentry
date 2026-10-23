@@ -21,6 +21,7 @@
 #include <clink/test/one_input_harness.hpp>
 
 #include "events.hpp"
+#include "decision.hpp"
 #include "idempotency.hpp"
 #include "patterns.hpp"
 #include "risk_profile.hpp"
@@ -586,6 +587,129 @@ void test_idempotency_guard_drops_a_retry_across_a_restore() {
     CHECK(h3.output_values().empty());
 }
 
+void test_decision_one_per_authorisation_with_the_three_outcomes() {
+    auto h = clink::test::make_keyed_process_function_harness(
+        cs::DecisionFn{cs::DecisionPolicy{}}, [](const cs::Event& e) { return e.card; });
+    h.open();
+
+    // Card 9001: four declined probes, then an approved strike. Every
+    // authorisation gets exactly one decision; the strike is blocked on the
+    // window the probes filled (four declines score 100).
+    for (int i = 0; i < 4; ++i) {
+        const auto e = auth(9001, 1.00 + i, false, T0 + i * 10'000);
+        h.process_element(e, e.ts);
+    }
+    const auto strike = auth(9001, 250.00, true, T0 + 50'000);
+    h.process_element(strike, strike.ts);
+    auto out = h.output_values();
+    CHECK(out.size() == 5);
+    if (out.size() == 5) {
+        CHECK(out[0].decision == "clear" && out[0].reason == "declined upstream");
+        CHECK(out[0].risk == 25 && out[3].risk == 100);
+        CHECK(out[4].decision == "block" && out[4].risk == 100);
+        CHECK(out[4].id == strike.id && out[4].card == 9001);
+        CHECK(out[4].decided_at > 0);
+    }
+    // Event time rides through to the sinks.
+    const auto recs = h.output().records();
+    CHECK(recs.size() == 5 && recs[4].event_time_ms == strike.ts);
+
+    // Card 9002: approved in London, then two hours later in Singapore.
+    const auto london = auth(9002, 20.00, true, T0, 51.5074, -0.1278);
+    const auto singapore = auth(9002, 20.00, true, T0 + 7'200'000, 1.3521, 103.8198);
+    h.process_element(london, london.ts);
+    h.process_element(singapore, singapore.ts);
+    out = h.output_values();
+    CHECK(out.size() == 7);
+    if (out.size() == 7) {
+        CHECK(out[5].decision == "clear");
+        CHECK(out[6].decision == "block");
+        CHECK(out[6].reason.rfind("impossible travel", 0) == 0);
+    }
+
+    // A large card-not-present approval is reviewed; the same amount with
+    // the card present clears (one large ticket alone scores 15).
+    const auto cnp = auth(9003, 450.00, true, T0, 51.5, -0.1, /*present=*/false);
+    const auto cp = auth(9004, 450.00, true, T0, 51.5, -0.1, /*present=*/true);
+    h.process_element(cnp, cnp.ts);
+    h.process_element(cp, cp.ts);
+    out = h.output_values();
+    CHECK(out.size() == 9);
+    if (out.size() == 9) {
+        CHECK(out[7].decision == "review" && out[7].reason.rfind("card not present", 0) == 0);
+        CHECK(out[8].decision == "clear" && out[8].risk == 15);
+    }
+
+    // The window: four declines, then an approval two hours later. The
+    // probes are over, the approval clears; a lifetime count would have
+    // blocked this card for good.
+    for (int i = 0; i < 4; ++i) {
+        const auto e = auth(9005, 1.00, false, T0 + i * 10'000);
+        h.process_element(e, e.ts);
+    }
+    const auto later = auth(9005, 30.00, true, T0 + 2 * 3'600'000);
+    h.process_element(later, later.ts);
+    out = h.output_values();
+    CHECK(out.size() == 14);
+    if (out.size() == 14) {
+        CHECK(out[12].risk == 100);
+        CHECK(out[13].decision == "clear" && out[13].risk == 0);
+    }
+
+    // The JSON the sinks consume carries every column the tables declare.
+    const auto json = cs::decision_to_json(out.back());
+    for (const char* key : {"\"id\":", "\"ts\":", "\"card\":", "\"amount\":", "\"decision\":",
+                            "\"reason\":", "\"risk\":", "\"decided_at\":"}) {
+        CHECK(json.find(key) != std::string::npos);
+    }
+}
+
+void test_decision_profile_survives_a_restore() {
+    const auto key_fn = [](const cs::Event& e) { return e.card; };
+    auto h = clink::test::make_keyed_process_function_harness(cs::DecisionFn{}, key_fn);
+    h.open();
+    for (int i = 0; i < 4; ++i) {
+        const auto e = auth(9001, 1.00 + i, false, T0 + i * 10'000);
+        h.process_element(e, e.ts);
+    }
+    const auto snap = h.snapshot(3);
+
+    // Restored from the checkpoint, the operator still holds the window
+    // with its four declines, so the strike that follows is blocked.
+    auto h2 = clink::test::make_keyed_process_function_harness(cs::DecisionFn{}, key_fn);
+    h2.restore_from(snap);
+    h2.open();
+    const auto strike = auth(9001, 250.00, true, T0 + 50'000);
+    h2.process_element(strike, strike.ts);
+    const auto out = h2.output_values();
+    CHECK(out.size() == 1);
+    if (out.size() == 1) {
+        CHECK(out[0].decision == "block" && out[0].risk == 100);
+    }
+}
+
+void test_decision_codec_round_trip() {
+    cs::Decision d;
+    d.id = 42;
+    d.ts = T0;
+    d.card = 9001;
+    d.amount = 12.34;
+    d.decision = "review";
+    d.reason = "risk 50: 2 declines on the card";
+    d.risk = 50;
+    d.decided_at = 1'700'000'000'000;
+    const auto codec = cs::decision_codec();
+    const auto bytes = codec.encode(d);
+    const auto back = codec.decode(bytes);
+    CHECK(back.has_value());
+    if (back.has_value()) {
+        CHECK(back->id == 42 && back->ts == T0 && back->card == 9001);
+        CHECK(std::abs(back->amount - 12.34) < 1e-9);
+        CHECK(back->decision == "review" && back->reason == d.reason);
+        CHECK(back->risk == 50 && back->decided_at == d.decided_at);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -600,6 +724,9 @@ int main() {
     test_risk_profile_folds_auths_and_survives_late_arrivals();
     test_idempotency_guard_drops_replays_and_expires_by_event_time();
     test_idempotency_guard_drops_a_retry_across_a_restore();
+    test_decision_one_per_authorisation_with_the_three_outcomes();
+    test_decision_profile_survives_a_restore();
+    test_decision_codec_round_trip();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed\n";

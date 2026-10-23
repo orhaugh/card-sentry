@@ -22,8 +22,8 @@
 # source under .clink/src when it built from source; otherwise this script
 # fetches just those two directories at the pinned tag. CLINK_SPEC_SOURCE
 # names another clink checkout to take the specification from, for a model
-# newer than the pinned release's: the empty-interval extension this scene
-# prompted landed on clink main after v0.11.0.
+# newer than the pinned release's. The empty-interval extension this scene
+# prompted is in the specification from clink v0.12.0, the pinned release.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,6 +41,17 @@ if ! ls "${TRACE_DIR}"/*.ndjson >/dev/null 2>&1; then
     exit 2
 fi
 
+# The release source under .clink/src is used only when it is at the pinned
+# tag: an install from a local checkout (CLINK_SOURCE) leaves an earlier
+# release's source there, and judging a run against an older specification
+# would be judging it against the wrong protocol. CLINK_SPEC_SOURCE is taken
+# as given.
+if [[ -z "${CLINK_SPEC_SOURCE:-}" && -d "${SRC}/.git" ]]; then
+    have="$(git -C "${SRC}" describe --tags --exact-match 2>/dev/null || true)"
+    if [[ "${have}" != "${CLINK_VERSION}" ]]; then
+        SRC="${ROOT}/.clink/spec-${CLINK_VERSION}"
+    fi
+fi
 if [[ ! -f "${SRC}/formal/ExactlyOnce.tla" || ! -x "${SRC}/scripts/formal-check.sh" ]]; then
     # The SDK fast path installs binaries only; fetch the specification and
     # its checker at the same tag the binaries were built from.

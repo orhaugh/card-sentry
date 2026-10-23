@@ -30,7 +30,7 @@ x-clink-env: &clink-env
 
 services:
   coordinator:
-    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.11.0}
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.0}
     # The image's entrypoint runs clink_node for a flag-first command (and
     # the `clink` CLI for a subcommand), so the daemon's flags come bare.
     command:
@@ -60,7 +60,10 @@ services:
   # clink's exactly-once postgres sink is built on.
   postgres:
     image: postgres:16
-    command: postgres -c max_prepared_transactions=32
+    # track_commit_timestamp lets the rail scene read, per row, when the
+    # transaction that wrote it committed: the visibility latency of each
+    # decision store, measured from outside the engine.
+    command: postgres -c max_prepared_transactions=32 -c track_commit_timestamp=on
     environment:
       POSTGRES_USER: sentry
       POSTGRES_PASSWORD: sentry
@@ -102,7 +105,7 @@ services:
       start_period: 10s
 
   worker1:
-    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.11.0}
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.0}
     command:
       - --role=worker
       - --id=worker-1
@@ -123,7 +126,7 @@ services:
     restart: on-failure
 
   worker2:
-    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.11.0}
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.0}
     command:
       - --role=worker
       - --id=worker-2

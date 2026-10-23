@@ -126,6 +126,61 @@ effectively-once, for a stable key and a deterministic query. Choosing
 between them is a question about the output's shape, not about how much
 one trusts the engine.
 
+## The decision path: what visibility costs
+
+The rail measures the trade the previous section describes. One stream of
+post-authorisation decisions, one per card authorisation, goes to three
+Postgres tables under the same checkpoint, and the scene reads each table's
+visibility latency from Postgres itself: the commit timestamp of the
+transaction that wrote a row (`track_commit_timestamp`) minus the time the
+operator emitted it.
+
+| Table | Sink and guarantee | p50 | p95 | max |
+|---|---|---|---|---|
+| `decisions` | two-phase commit, exactly-once | 1,019 ms | 2,216 ms | 3,004 ms |
+| `decisions_fast` | upsert by authorisation id, effectively-once | 17 ms | 82 ms | 280 ms |
+| `decisions_append` | plain insert, at-least-once | 17 ms | 83 ms | 208 ms |
+
+One run on clink v0.12.0: 569,873 decisions, a one-second checkpoint
+interval, a worker killed while a batch's decisions were landing. Afterwards
+the two-phase table held one row per authorisation, the keyed table the same
+rows column for column bar the wall-clock one, and the append table 7,600
+rows twice.
+
+The two-phase table's latency is the checkpoint: a row waits for the barrier
+that closes its interval, for every subtask to acknowledge, for the completion
+marker, and for `COMMIT PREPARED`. A shorter interval cuts it and asks more of
+everything else (more prepared transactions, more markers, more acknowledgements
+per second). The upsert and append tables commit at their flushes, so their
+latency is the flush cadence, not the checkpoint's.
+
+What the upsert table's speed is bought with:
+
+- Rows are visible before their checkpoint completes, so a failure can rewrite
+  rows a reader has already seen. The rewrite is harmless only if the replay
+  produces the same values, which holds when the operator's output is a
+  function of its restored state and its input. The decision operator stamps
+  one field from the wall clock and declares itself nondeterministic to the
+  engine for that reason; the delivery analyser then warns that the job's
+  output is not reproducible across a replay, and the gate compares the two
+  tables on every column but that one. An operator that called a remote model
+  or read a clock into its decision could not make this claim, and its keyed
+  table would show a decision flipping under a reader after a failure.
+- Change data captured from the upsert table carries every rewrite as a change,
+  so a consumer of that feed is at-least-once and must dedupe by id.
+- The key must be the decision's identity. Here it is the authorisation's event
+  id, which the idempotency guard already treats as the event's identity.
+
+The append table is what neither guarantee gives: after the kill it holds the
+replayed interval twice, row for row.
+
+A payments platform needs both tiers, for different readers. The case table and
+the two-phase decision table are the record: an auditor, a case-management
+system, a regulator's report. The keyed table is the working copy a
+latency-bound consumer reads. The authorisation decision itself, the one that
+approves or declines while the cardholder waits, is on neither: it belongs on
+the request path, and the stream decides what happens next.
+
 ## Idempotency is not exactly-once
 
 The producer in the scene re-sends a batch it had already delivered. Every
@@ -211,10 +266,12 @@ the graph and is switched off by a parameter.
   that received nothing in an interval and declined its commit is the first
   step the checker could not explain. clink's own traced workloads never
   produce that step; a feed with nine alerts in ninety days produces it in
-  almost every interval. The specification was extended for it on clink
-  main, the same run is accepted by the extended model (4,281 events, every
-  one a step the protocol allows) and recorded among the traces clink
-  validates on every push, and the scene still reports the verdict of
+  almost every interval. The specification was extended for it, released
+  in clink v0.12.0, which this repository pins: the same run is accepted by
+  the extended model (4,281 events, every one a step the protocol allows)
+  and recorded among the traces clink validates on every push, and the
+  denser run with the decision stream beside it (4,811 events, a worker
+  killed mid-batch) is accepted too. The scene still reports the verdict of
   whichever checker it is given. Finding the edge with a realistic workload
   is what the showcase is for.
 - `cluster/replay.sh` is the forensic side of the same discipline: the

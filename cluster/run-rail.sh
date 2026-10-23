@@ -29,6 +29,22 @@
 # the protocol trace of every process and, after the run, checks it against
 # clink's exactly-once specification (cluster/validate-trace.sh).
 #
+# The decision path (DECISIONS=1, the default) adds a third gate. Every card
+# authorisation gets exactly one post-authorisation risk decision (clear,
+# review or block) from a keyed operator over the same per-card profile the
+# lookup serves, and the one decision stream fans out to three Postgres
+# tables under the same checkpoint, each with the delivery its sink can
+# offer: `decisions` through two-phase commit (exactly-once: rows appear
+# when their checkpoint completes), `decisions_fast` through the keyed
+# upsert sink (effectively-once: INSERT ... ON CONFLICT (id) DO UPDATE at
+# every flush, so the replayed interval rewrites the same rows and the
+# table is visible before the checkpoint completes) and `decisions_append`
+# through plain inserts (at-least-once: the replayed interval is inserted
+# again). Gate 3 holds the first two to one row per authorisation and to
+# each other, counts the third's duplicates, and reads each table's
+# visibility latency, the commit timestamp of the row's transaction minus
+# the operator's emission time, from Postgres (track_commit_timestamp).
+#
 #   CLINK_IMAGE=...   override the runtime image
 #   DAYS=n            tape length (default 90, ~0.8M events; same campaigns
 #                     as the 3-day tape, spread over 90 days of noise)
@@ -57,6 +73,13 @@
 #                     per job (Kafka's commit-confirmed protocol, or the
 #                     recoverable family Postgres belongs to), and this job
 #                     mixes both when the Kafka alert sink is on
+#   DECISIONS=0       no decision stores (the job writes decisions to a file)
+#   DECISION_TIERS=2pc only the two-phase-commit decision table, so every
+#                     sink in the job is exactly-once (with DIAG=0): the
+#                     coordinator then labels the job END_TO_END_EXACTLY_ONCE
+#   DIAG=0            no at-least-once diagnostics file sinks: the alerts go
+#                     to the transactional stores only and the OTP healthy
+#                     branch to the exactly-once file sink
 #   KEEP_UP=1         leave the cluster running after the gate
 
 set -euo pipefail
@@ -73,6 +96,21 @@ GUARD_TTL_DAYS="${GUARD_TTL_DAYS:-30}"
 GUARD_TTL_MS=$((GUARD_TTL_DAYS * 86400000))
 KAFKA_ALERTS="${KAFKA_ALERTS:-1}"
 TRACE="${TRACE:-0}"
+DECISIONS="${DECISIONS:-1}"
+DECISION_TIERS="${DECISION_TIERS:-all}"
+DIAG="${DIAG:-1}"
+if [[ "${DECISION_TIERS}" != "all" && "${DECISION_TIERS}" != "2pc" ]]; then
+    echo "DECISION_TIERS must be 'all' or '2pc'" >&2
+    exit 2
+fi
+DEC_TABLE=""; DEC_FAST_TABLE=""; DEC_APPEND_TABLE=""
+if [[ "${DECISIONS}" == "1" ]]; then
+    DEC_TABLE="decisions"
+    if [[ "${DECISION_TIERS}" == "all" ]]; then
+        DEC_FAST_TABLE="decisions_fast"
+        DEC_APPEND_TABLE="decisions_append"
+    fi
+fi
 if [[ "${TRACE}" == "1" && "${KAFKA_ALERTS}" != "0" ]]; then
     echo "TRACE=1 needs KAFKA_ALERTS=0: the exactly-once specification's trace module models one" >&2
     echo "sink family per job, and with the Kafka alert sink on this job mixes the Kafka and the" >&2
@@ -163,7 +201,15 @@ done
 psql_ -q -c "SET client_min_messages TO WARNING;
              DROP TABLE IF EXISTS alerts;
              CREATE TABLE alerts (pattern text, entity_kind text, entity_id bigint,
-                                  ts bigint, detail text);"
+                                  ts bigint, detail text);
+             DROP TABLE IF EXISTS decisions; DROP TABLE IF EXISTS decisions_fast;
+             DROP TABLE IF EXISTS decisions_append;
+             CREATE TABLE decisions (id bigint, ts bigint, card bigint, amount double precision,
+                                     decision text, reason text, risk int, decided_at bigint);
+             CREATE TABLE decisions_fast (id bigint PRIMARY KEY, ts bigint, card bigint,
+                                          amount double precision, decision text, reason text,
+                                          risk int, decided_at bigint);
+             CREATE TABLE decisions_append (LIKE decisions);"
 
 say "building the job plugin inside the runtime image"
 ${COMPOSE} exec -T coordinator bash -c "
@@ -173,7 +219,11 @@ ${COMPOSE} exec -T coordinator bash -c "
     cp /tmp/job-build/card_sentry_job.so /jobs/card_sentry_job.so
 "
 
-say "submitting: kafka source, idempotency guard $([[ "${GUARD}" == "1" ]] && echo "ON (TTL ${GUARD_TTL_DAYS} days of event time)" || echo OFF), postgres 2PC$([[ "${KAFKA_ALERTS}" == "1" ]] && echo " + kafka 2PC") sinks, checkpoints every 1000 ms"
+DEC_DESC="no decision stores"
+if [[ "${DECISIONS}" == "1" ]]; then
+    DEC_DESC="decisions to $([[ "${DECISION_TIERS}" == "all" ]] && echo "postgres 2PC + upsert + append" || echo "postgres 2PC only")"
+fi
+say "submitting: kafka source, idempotency guard $([[ "${GUARD}" == "1" ]] && echo "ON (TTL ${GUARD_TTL_DAYS} days of event time)" || echo OFF), postgres 2PC$([[ "${KAFKA_ALERTS}" == "1" ]] && echo " + kafka 2PC") alert sinks, ${DEC_DESC}, diagnostics files $([[ "${DIAG}" == "1" ]] && echo on || echo off), checkpoints every 1000 ms"
 ALERTS_ENV=(-e "CS_KAFKA_ALERTS_TOPIC=${ALERTS_TOPIC}")
 if [[ "${KAFKA_ALERTS}" != "1" ]]; then ALERTS_ENV=(-e CS_KAFKA_ALERTS_TOPIC=); fi
 # The job is unbounded (a topic has no end), so the submit's completion
@@ -184,6 +234,8 @@ SUBMIT_OUT="$(${COMPOSE} exec -T \
     "${ALERTS_ENV[@]}" \
     -e "CS_PG_DSN=${DSN}" -e CS_PG_TABLE=alerts -e CS_OUT_DIR=/out \
     -e "CS_GUARD=${GUARD}" -e "CS_GUARD_TTL_MS=${GUARD_TTL_MS}" -e "CS_GUARD_DEBUG=${GUARD_DEBUG:-0}" \
+    -e "CS_DIAG=${DIAG}" -e "CS_DECISIONS_TABLE=${DEC_TABLE}" \
+    -e "CS_DECISIONS_FAST_TABLE=${DEC_FAST_TABLE}" -e "CS_DECISIONS_APPEND_TABLE=${DEC_APPEND_TABLE}" \
     coordinator clink_submit_job \
     --job=/jobs/card_sentry_job.so \
     --coordinator-host=127.0.0.1 --coordinator-port=6123 \
@@ -200,8 +252,10 @@ fi
 poll 60 "job ${JOB_ID} to be RUNNING" job_running
 echo "job ${JOB_ID} accepted and RUNNING ($(curl -fsS "${COORD}/api/v1/jobs" | grep -o '"expected_completion":[0-9]*' | head -1 | cut -d: -f2) subtasks); the submit's completion wait was not waited for - a topic has no end"
 # The coordinator names the job's weakest sink: the diagnostic file sinks
-# are at-least-once by design, which is why the line below does not read
-# EXACTLY_ONCE. The two stores the gates read are the transactional ones.
+# and the append decision table are at-least-once by design, which is why
+# the line below does not read EXACTLY_ONCE in the default run. With
+# DECISION_TIERS=2pc DIAG=0 every sink is transactional and it reads
+# END_TO_END_EXACTLY_ONCE.
 ${COMPOSE} logs --no-color coordinator 2>&1 | grep -o "job delivery guarantee: .*" | tail -1 || true
 
 resend_batch() {
@@ -215,14 +269,29 @@ if [[ "${DUP_AFTER_KILL}" == "1" ]]; then
 else
     say "producing the feed in ${CHUNKS} batches; batch ${DUP_CHUNK} is re-sent after batch $((DUP_CHUNK + 1))"
 fi
+# The decision stores show records landing while a batch is still being
+# produced, which is when a kill cuts an interval that holds rows: the
+# two-phase table loses nothing, the keyed table is rewritten on the replay,
+# the append table keeps the replay's duplicates. Without the decision
+# stores the kill lands between batches, as the earlier scenes did.
+dec_live_rows() {
+    local t="decisions"
+    if [[ "${DECISION_TIERS}" == "all" ]]; then t="decisions_append"; fi
+    psql_ -c "SELECT count(*) FROM ${t}" 2>/dev/null | tr -d '[:space:]' || echo 0
+}
+produce_chunk() { # <file name under /tape/feed>
+    kafka sh -c "${KAFKA_BIN}/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+        --topic ${EVENTS_TOPIC} < /tape/feed/$1" >> out-cluster/rail-producer.log 2>&1
+}
 KILLED=0
 PRODUCED=0
-for chunk in data-rail/feed/chunk-*.ndjson; do
+CHUNK_FILES=(data-rail/feed/chunk-*.ndjson)
+for ((ci = 0; ci < ${#CHUNK_FILES[@]}; ci++)); do
+    chunk="${CHUNK_FILES[$ci]}"
     name="$(basename "${chunk}")"
     stem="${name%.ndjson}"
     idx=$((10#${stem#chunk-}))
-    kafka sh -c "${KAFKA_BIN}/kafka-console-producer.sh --bootstrap-server localhost:9092 \
-        --topic ${EVENTS_TOPIC} < /tape/feed/${name}" >> out-cluster/rail-producer.log 2>&1
+    produce_chunk "${name}"
     PRODUCED=$((PRODUCED + 1))
     if [[ "${DUP_AFTER_KILL}" != "1" && "${idx}" -eq $((DUP_CHUNK + 1)) ]]; then
         resend_batch
@@ -231,11 +300,32 @@ for chunk in data-rail/feed/chunk-*.ndjson; do
     echo "   batch ${idx} produced; case table: ${rows} alert(s) committed"
     if [[ "${KILLED}" -eq 0 && "${rows}" -ge "${KILL_AT}" && "${idx}" -ge "${DUP_CHUNK}" ]]; then
         remaining=$((CHUNKS - PRODUCED))
-        say "killing worker2 -9 now: ${rows} alerts committed, ${remaining} batches still to come"
+        in_flight_note=""
+        PRODUCER_PID=""
+        if [[ "${DECISIONS}" == "1" && $((ci + 1)) -lt ${#CHUNK_FILES[@]} ]]; then
+            next_name="$(basename "${CHUNK_FILES[$((ci + 1))]}")"
+            next_stem="${next_name%.ndjson}"
+            next_idx=$((10#${next_stem#chunk-}))
+            before="$(dec_live_rows)"
+            produce_chunk "${next_name}" &
+            PRODUCER_PID=$!
+            in_flight() { [[ $(( $(dec_live_rows) - before )) -ge 2000 ]]; }
+            poll 60 "batch ${next_idx}'s decisions to start landing" in_flight
+            in_flight_note=", batch ${next_idx} in flight"
+        fi
+        say "killing worker2 -9 now: ${rows} alerts committed${in_flight_note}, ${remaining} batches still to come"
         prepared="$(psql_ -c "SELECT count(*) FROM pg_prepared_xacts" | tr -d '[:space:]')"
         echo "   prepared (in-doubt) transactions in postgres at the kill: ${prepared}"
         docker kill -s KILL cluster-worker2-1 >/dev/null
         KILLED=1
+        if [[ -n "${PRODUCER_PID}" ]]; then
+            wait "${PRODUCER_PID}" || true
+            PRODUCED=$((PRODUCED + 1))
+            ci=$((ci + 1))
+            if [[ "${DUP_AFTER_KILL}" != "1" && "${next_idx}" -eq $((DUP_CHUNK + 1)) ]]; then
+                resend_batch
+            fi
+        fi
         restored() { ${COMPOSE} logs --no-color coordinator 2>&1 | grep -q "restore point:"; }
         if poll 60 "the coordinator to restore the job" restored; then
             ${COMPOSE} logs --no-color coordinator 2>&1 | grep -oE "worker lost: .*|restore point: .*" | sed 's/^/   coordinator: /' | tail -2
@@ -317,6 +407,52 @@ else
     say "gate 2 skipped: KAFKA_ALERTS=0, the case table is the only exactly-once store in this run"
 fi
 
+DEC_RC=0
+if [[ "${DECISIONS}" == "1" ]]; then
+    say "gate 3: the decision stores, one decision per authorisation across three delivery tiers"
+    AUTH_EXPECTED="$(grep -c '"type":"auth"' data-rail/events.ndjson || true)"
+    dec_rows() { psql_ -c "SELECT count(*) FROM decisions" 2>/dev/null | tr -d '[:space:]' || echo 0; }
+    dec_reached() { [[ "$(dec_rows)" -ge "${AUTH_EXPECTED}" ]]; }
+    poll 240 "${AUTH_EXPECTED} decisions in the two-phase-commit table" dec_reached
+    sleep 3
+    read -r dec_n dec_d <<<"$(psql_ -F ' ' -c "SELECT count(*), count(DISTINCT id) FROM decisions")"
+    echo "authorisations in the feed: ${AUTH_EXPECTED} (each decided once by the operator; the re-sent batch's were dropped by the guard)"
+    echo "decisions, two-phase commit:  ${dec_n} rows, ${dec_d} distinct ids"
+    fast_n=0; diff_ab=0; diff_ba=0
+    if [[ "${DECISION_TIERS}" == "all" ]]; then
+        fast_n="$(psql_ -c "SELECT count(*) FROM decisions_fast" | tr -d '[:space:]')"
+        cols="id,ts,card,amount,decision,reason,risk"
+        diff_ab="$(psql_ -c "SELECT count(*) FROM (SELECT ${cols} FROM decisions EXCEPT SELECT ${cols} FROM decisions_fast) x" | tr -d '[:space:]')"
+        diff_ba="$(psql_ -c "SELECT count(*) FROM (SELECT ${cols} FROM decisions_fast EXCEPT SELECT ${cols} FROM decisions) x" | tr -d '[:space:]')"
+        read -r app_n app_d <<<"$(psql_ -F ' ' -c "SELECT count(*), count(DISTINCT id) FROM decisions_append")"
+        echo "decisions_fast, upsert by id: ${fast_n} rows; rows that differ from the two-phase-commit table: ${diff_ab} + ${diff_ba}"
+        echo "decisions_append, plain insert: ${app_n} rows, ${app_d} distinct ids: $((app_n - app_d)) duplicate row(s), the replayed interval inserted again (at-least-once, by design)"
+    fi
+    echo "by outcome: $(psql_ -F '=' -c "SELECT decision, count(*) FROM decisions GROUP BY 1 ORDER BY 1" | tr '\n' ' ')"
+    echo "visibility latency per store: the commit timestamp of the row's transaction minus the operator's emission time, in ms (checkpoints every 1000 ms)"
+    for t in decisions decisions_fast decisions_append; do
+        if [[ "${DECISION_TIERS}" != "all" && "${t}" != "decisions" ]]; then continue; fi
+        psql_ -F ' ' -c "SELECT '${t}', round(percentile_cont(0.5) WITHIN GROUP (ORDER BY lat))::bigint,
+                                round(percentile_cont(0.95) WITHIN GROUP (ORDER BY lat))::bigint, max(lat)
+                         FROM (SELECT (extract(epoch FROM pg_xact_commit_timestamp(xmin)) * 1000)::bigint - decided_at AS lat
+                               FROM ${t}) s" \
+            | awk '{printf "   %-17s p50 %6s ms   p95 %6s ms   max %6s ms\n", $1, $2, $3, $4}'
+    done
+    psql_ -c "SELECT row_to_json(d) FROM decisions d ORDER BY id LIMIT 50000" > out-cluster/rail-decisions-head.ndjson 2>/dev/null || true
+    if [[ "${GUARD}" == "1" ]]; then
+        if [[ "${dec_n}" -ne "${AUTH_EXPECTED}" || "${dec_d}" -ne "${AUTH_EXPECTED}" ]]; then DEC_RC=1; fi
+        if [[ "${DECISION_TIERS}" == "all" ]] && [[ "${fast_n}" -ne "${AUTH_EXPECTED}" || "${diff_ab}" -ne 0 || "${diff_ba}" -ne 0 ]]; then DEC_RC=1; fi
+        if [[ "${DEC_RC}" -eq 0 ]]; then
+            echo "OK: one decision per authorisation in the two-phase-commit table$([[ "${DECISION_TIERS}" == "all" ]] && echo ", and the keyed table holds the same decisions, row for row")."
+        else
+            echo "FAIL: the decision stores do not hold one decision per authorisation" >&2
+        fi
+    else
+        echo "without the guard the re-sent batch was decided twice: the two-phase-commit table shows the input's duplication"
+        echo "   ($((dec_n - dec_d)) extra rows); a keyed store collapses it to one row per id and hides it."
+    fi
+fi
+
 say "the diagnostics side"
 diag_lines="$(cat out-cluster/alerts-*.ndjson 2>/dev/null | grep -c . || true)"
 echo "file sinks: ${diag_lines} alert lines; case table: $(case_rows) rows. The files are at-least-once"
@@ -347,8 +483,8 @@ fi
 
 say "verdict"
 if [[ "${GUARD}" == "1" ]]; then
-    if [[ "${PG_RC}" -ne 0 || "${KAFKA_RC}" -ne 0 ]]; then
-        echo "FAIL: exactly-once did not hold (postgres rc=${PG_RC}, kafka rc=${KAFKA_RC})" >&2
+    if [[ "${PG_RC}" -ne 0 || "${KAFKA_RC}" -ne 0 || "${DEC_RC}" -ne 0 ]]; then
+        echo "FAIL: exactly-once did not hold (postgres rc=${PG_RC}, kafka rc=${KAFKA_RC}, decisions rc=${DEC_RC})" >&2
         exit 1
     fi
     if [[ "${KAFKA_ALERTS}" == "1" ]]; then
@@ -357,6 +493,14 @@ if [[ "${GUARD}" == "1" ]]; then
     else
         echo "OK: a worker died mid-flight and a batch was delivered twice; the case table holds"
         echo "    exactly the manifest's alerts."
+    fi
+    if [[ "${DECISIONS}" == "1" ]]; then
+        if [[ "${DECISION_TIERS}" == "all" ]]; then
+            echo "    Every authorisation has exactly one decision in the two-phase-commit table; the keyed"
+            echo "    table converged to the same rows, and the append table shows the replay's duplicates."
+        else
+            echo "    Every authorisation has exactly one decision in the two-phase-commit table."
+        fi
     fi
 else
     if [[ "${PG_RC}" -eq 0 && "${KAFKA_RC}" -eq 0 ]]; then
@@ -371,12 +515,13 @@ if [[ "${TRACE}" == "1" ]]; then
     # Keep the run's trace where the next scene's start-up wipe cannot reach it.
     rm -rf out-cluster/rail-trace && cp -R cluster/trace out-cluster/rail-trace
     say "the recorded run against the exactly-once specification (copy kept under out-cluster/rail-trace)"
-    # Reported, not gated: the gates above are the scene's verdict. At clink
-    # v0.11.0 the specification models every prepare as staging a
+    # Reported, not gated: the gates above are the scene's verdict. clink
+    # v0.11.0's specification modelled every prepare as staging a
     # transaction, so a sink that received nothing in an interval (most
-    # intervals, for a feed with nine alerts in ninety days) and therefore
-    # declines its commit is the first step the checker cannot explain. The
-    # checker stopping exactly there, and naming the event, is the point.
+    # intervals, for a feed with nine alerts in ninety days) and declined its
+    # commit was the first step its checker could not explain. From v0.12.0,
+    # the pinned release, the specification has that step and accepts the
+    # run; a checker that still stops names the event it cannot explain.
     set +e
     cluster/validate-trace.sh cluster/trace
     TRACE_RC=$?

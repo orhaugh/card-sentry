@@ -75,6 +75,7 @@
 #include <clink/runtime/output_tag.hpp>
 #include <clink/time/event_time.hpp>
 
+#include "decision.hpp"
 #include "events.hpp"
 #include "idempotency.hpp"
 #include "patterns.hpp"
@@ -97,6 +98,7 @@ void define_job(clink::api::Pipeline& env) {
 
     env.registry().register_type<Event>("cs_event", cs::event_codec());
     env.registry().register_type<Alert>("cs_alert", cs::alert_codec());
+    env.registry().register_type<cs::Decision>("cs_decision", cs::decision_codec());
 
     const std::string source_kind = env_or("CS_SOURCE", "file");
     const std::string in = env_or("CS_EVENTS", "/data/events.ndjson");
@@ -110,6 +112,15 @@ void define_job(clink::api::Pipeline& env) {
     const std::string pg_dsn = env_or("CS_PG_DSN", "");
     const std::string pg_table = env_or("CS_PG_TABLE", "alerts");
     const std::string alerts_topic = env_or("CS_KAFKA_ALERTS_TOPIC", "");
+    // The diagnostics file sinks are at-least-once and cap the job's
+    // guarantee; CS_DIAG=0 drops them where a transactional store takes
+    // the alerts, so a run can be end-to-end exactly-once on every sink.
+    const bool diag = env_or("CS_DIAG", "1") != "0";
+    // The decision path's stores, each optional: a two-phase-commit table,
+    // an upsert table keyed by the authorisation id, a plain append table.
+    const std::string decisions_table = env_or("CS_DECISIONS_TABLE", "");
+    const std::string decisions_fast_table = env_or("CS_DECISIONS_FAST_TABLE", "");
+    const std::string decisions_append_table = env_or("CS_DECISIONS_APPEND_TABLE", "");
 
     // The input. The Kafka source checkpoints its per-partition offsets as
     // operator state, so a restore resumes exactly where the checkpoint cut
@@ -164,17 +175,110 @@ void define_job(clink::api::Pipeline& env) {
                       .process<Event>("cs_idempotency_guard",
                                       {{"ttl_ms", std::to_string(guard_ttl.count())},
                                        {"debug", guard_debug ? "1" : "0"},
-                                       {"enabled", guard_on ? "1" : "0"}},
+                                       {"enabled", guard_on ? "1" : "0"},
+                                       // Declared for the delivery analyser: its output
+                                       // is a function of its state and its input.
+                                       {"determinism", "deterministic"}},
                                       "cs-idempotency-guard");
     events.uid("cs-idempotency-guard");
+
+    // The decision path: one post-authorisation risk decision per card
+    // authorisation, keyed by card, from the card's recent declines and its
+    // last fix (decision.hpp). A named operator with its thresholds as spec params,
+    // for the same reason as the guard. Stateful, so it carries a uid.
+    env.registry().register_operator<Event, cs::Decision>(
+        "cs_decision",
+        [](const clink::plugin::BuildContext& ctx)
+            -> std::shared_ptr<clink::Operator<Event, cs::Decision>> {
+            cs::DecisionPolicy policy;
+            policy.window_ms = std::stoll(ctx.param_or("window_ms", "3600000"));
+            policy.review_at = std::stoi(ctx.param_or("review_at", "50"));
+            policy.block_at = std::stoi(ctx.param_or("block_at", "100"));
+            policy.review_amount = std::stod(ctx.param_or("review_amount", "400"));
+            policy.max_speed_kmh = std::stod(ctx.param_or("max_speed_kmh", "900"));
+            return std::make_shared<
+                clink::detail::KeyedProcessFunctionAdapter<std::int64_t, Event, cs::Decision>>(
+                std::make_shared<cs::DecisionFn>(policy),
+                [](const Event& e) { return e.card; }, nullptr, "decision");
+        });
+    auto decisions = events.filter([](const Event& e) { return e.type == EventType::Auth; })
+                         .key_by([](const Event& e) { return e.card; })
+                         .process<cs::Decision>("cs_decision",
+                                                {{"window_ms", "3600000"},
+                                                 {"review_at", "50"},
+                                                 {"block_at", "100"},
+                                                 {"review_amount", "400"},
+                                                 {"max_speed_kmh", "900"},
+                                                 // Declared, so the analyser warns rather
+                                                 // than reports unknown: every field but one
+                                                 // is a function of the restored state and
+                                                 // the replayed input.
+                                                 {"determinism",
+                                                  "nondeterministic: decided_at is the wall "
+                                                  "clock at emission"}},
+                                                "cs-decision");
+    decisions.uid("cs-decision");
+    auto decision_jsons =
+        decisions.map<std::string>([](const cs::Decision& d) { return cs::decision_to_json(d); });
+    {
+        // Three stores for one stream, each with the delivery its sink can
+        // offer; the rail scene reads all three from outside the engine.
+        const std::string columns = "id,ts,card,amount,decision,reason,risk,decided_at";
+        bool any = false;
+        if (!pg_dsn.empty() && !decisions_table.empty()) {
+            // Exactly-once: rows appear when their checkpoint completes.
+            clink::api::SinkDescriptor pg;
+            pg.op_type = "postgres_2pc_sink";
+            pg.channel_type = "string";
+            pg.params = {{"conninfo", pg_dsn}, {"table", decisions_table}, {"columns", columns}};
+            decision_jsons.sink(pg, "cs-decisions-2pc");
+            any = true;
+        }
+        if (!pg_dsn.empty() && !decisions_fast_table.empty()) {
+            // Effectively-once: INSERT ... ON CONFLICT (id) DO UPDATE at every
+            // flush, so a replayed interval rewrites the same rows. Visible
+            // at the flush, before the checkpoint completes.
+            clink::api::SinkDescriptor pg;
+            pg.op_type = "postgres_upsert_sink";
+            pg.channel_type = "string";
+            pg.params = {{"conninfo", pg_dsn},
+                         {"table", decisions_fast_table},
+                         {"columns", columns},
+                         {"key_columns", "id"},
+                         {"batch_records", "200"}};
+            decision_jsons.sink(pg, "cs-decisions-fast");
+            any = true;
+        }
+        if (!pg_dsn.empty() && !decisions_append_table.empty()) {
+            // At-least-once: plain inserts, so a replayed interval adds its
+            // rows a second time.
+            clink::api::SinkDescriptor pg;
+            pg.op_type = "postgres_sink";
+            pg.channel_type = "string";
+            pg.params = {{"conninfo", pg_dsn},
+                         {"table", decisions_append_table},
+                         {"columns", columns},
+                         {"batch_records", "200"}};
+            decision_jsons.sink(pg, "cs-decisions-append");
+            any = true;
+        }
+        if (!any) {
+            decision_jsons.sink(
+                clink::api::FileTextSink::builder().path(out_dir + "/decisions.ndjson").build());
+        }
+    }
 
     const auto sink_alerts = [&](clink::api::DataStream<Alert> stream, const std::string& name) {
         auto jsons =
             stream.map<std::string>([](const Alert& a) { return cs::alert_to_json(a); });
         // Diagnostics: at-least-once, duplicates after a restore are expected.
-        jsons.sink(clink::api::FileTextSink::builder()
-                       .path(out_dir + "/alerts-" + name + ".ndjson")
-                       .build());
+        // Kept whenever no transactional store takes the alerts, so the
+        // stream always has a sink.
+        if (diag || (pg_dsn.empty() && alerts_topic.empty())) {
+            jsons.sink(clink::api::FileTextSink::builder()
+                           .path(out_dir + "/alerts-" + name + ".ndjson")
+                           .build());
+        }
         if (!pg_dsn.empty()) {
             // The exactly-once case store: rows land iff their checkpoint
             // completes globally; a prepared-but-uncommitted transaction
@@ -276,11 +380,23 @@ void define_job(clink::api::Pipeline& env) {
                     std::function<Alert(const cs::Match&)>(cs::otp_timed_out_alert));
         sink_alerts(healthy.side_output<Alert>(tag), "otp-never-verified");
         // Healthy completions drain to a diagnostics file (not alerts-*);
-        // in the spec world every output needs a consumer.
-        healthy.map<std::string>([](const Alert& a) { return cs::alert_to_json(a); })
-            .sink(clink::api::FileTextSink::builder()
-                      .path(out_dir + "/otp-healthy.ndjson")
-                      .build());
+        // in the spec world every output needs a consumer. Under CS_DIAG=0
+        // they go to the exactly-once file sink instead (parts published by
+        // rename when their checkpoint completes), so no at-least-once sink
+        // remains to cap the job's guarantee.
+        auto healthy_jsons =
+            healthy.map<std::string>([](const Alert& a) { return cs::alert_to_json(a); });
+        if (diag) {
+            healthy_jsons.sink(clink::api::FileTextSink::builder()
+                                   .path(out_dir + "/otp-healthy.ndjson")
+                                   .build());
+        } else {
+            clink::api::SinkDescriptor two_phase;
+            two_phase.op_type = "file_2pc_sink_string";
+            two_phase.channel_type = "string";
+            two_phase.params = {{"dir", out_dir + "/otp-healthy-2pc"}};
+            healthy_jsons.sink(two_phase, "cs-otp-healthy-2pc");
+        }
     }
 
     // structuring: sub-band transfers whose running total crosses the trip.

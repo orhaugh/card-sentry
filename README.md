@@ -27,6 +27,11 @@ any project would.
   checkpoint, an at-least-once producer that re-sends a batch, and a worker
   killed mid-flight. The case table and the `read_committed` alerts topic
   end holding exactly the manifest's alerts.
+- **One decision per authorisation**: every card authorisation is decided
+  (clear, review or block) and written to three Postgres tables under one
+  checkpoint, one per delivery guarantee: two-phase commit, a keyed upsert and
+  a plain insert. The scene measures what each costs in visibility latency and
+  what each holds after the kill.
 - An idempotency guard in front of the detectors, with its negative control:
   exactly-once delivery does not dedupe the input, and the scene shows what
   happens without the guard.
@@ -42,7 +47,7 @@ any project would.
 
 How the guarantees fit together, stage by stage and with their limits, is
 written up in [docs/exactly-once-in-practice.md](docs/exactly-once-in-practice.md).
-The repository pins clink v0.11.0; `scripts/get-clink.sh` installs it, and
+The repository pins clink v0.12.0; `scripts/get-clink.sh` installs it, and
 the cluster scenes pull the matching published runtime image.
 
 ## Quick start
@@ -207,17 +212,17 @@ The gates read the stores from outside the engine: the case table with
 `isolation.level=read_committed`:
 
 ```
-== submitting: kafka source, idempotency guard ON (TTL 30 days of event time), postgres 2PC + kafka 2PC sinks, checkpoints every 1000 ms
-job 1 accepted and RUNNING (24 subtasks); the submit's completion wait was not waited for - a topic has no end
+== submitting: kafka source, idempotency guard ON (TTL 30 days of event time), postgres 2PC + kafka 2PC alert sinks, decisions to postgres 2PC + upsert + append, diagnostics files on, checkpoints every 1000 ms
+job 1 accepted and RUNNING (28 subtasks); the submit's completion wait was not waited for - a topic has no end
 == producing the feed in 16 batches; batch 2 is re-sent after batch 3
-   batch 2 produced; case table: 0 alert(s) committed
+   batch 2 produced; case table: 1 alert(s) committed
    batch 2 re-sent: the producer timed out on its ack and retried
    batch 3 produced; case table: 4 alert(s) committed
-== killing worker2 -9 now: 4 alerts committed, 12 batches still to come
+== killing worker2 -9 now: 4 alerts committed, batch 4 in flight, 12 batches still to come
    coordinator: worker lost: worker-2 (heartbeat timeout)
-   coordinator: restore point: checkpoint 20 (latest_completed=20 latest_confirmed=20 tracked=5)
+   coordinator: restore point: checkpoint 18 (latest_completed=18 latest_confirmed=18 tracked=5)
    worker2 killed; compose restarts it, the coordinator rolled the job back to that checkpoint and redeployed on the survivor
-   batch 4 produced; case table: 4 alert(s) committed
+   batch 5 produced; case table: 4 alert(s) committed
    ...
    batch 15 produced; case table: 9 alert(s) committed
 == gate 1: the case table against the manifest (exactly-once into postgres)
@@ -250,6 +255,89 @@ recovery, so for a completed checkpoint both stores end holding the
 interval. The design note spells out why "both end committed" is the
 honest claim and "atomic" is not.
 
+## One decision per authorisation, three stores
+
+Alerts are rare: nine in ninety days. Decisions are not. Every card
+authorisation is owed one, and something downstream acts on each: a hold, a
+step-up, a review. The rail job adds that path. A keyed operator
+(`app/src/decision.hpp`) decides every authorisation the guard admits, from
+the card's declines in the last hour of event time, its last position and the
+amount, and the one decision stream fans out to three Postgres tables under
+the same checkpoint:
+
+| Table | Sink | Guarantee | Visible |
+|---|---|---|---|
+| `decisions` | two-phase commit | exactly-once | when its checkpoint completes |
+| `decisions_fast` | upsert by authorisation id | effectively-once | at each flush |
+| `decisions_append` | plain insert | at-least-once | at each flush |
+
+With the decision stores on, the kill lands while the next batch's decisions
+are landing, so the failure cuts an interval that holds rows. Gate 3 reads all
+three tables with `psql`, and Postgres's commit timestamps give each table's
+visibility latency: when the transaction that wrote a row committed, minus
+when the operator emitted it.
+
+```
+== gate 3: the decision stores, one decision per authorisation across three delivery tiers
+authorisations in the feed: 569873 (each decided once by the operator; the re-sent batch's were dropped by the guard)
+decisions, two-phase commit:  569873 rows, 569873 distinct ids
+decisions_fast, upsert by id: 569873 rows; rows that differ from the two-phase-commit table: 0 + 0
+decisions_append, plain insert: 577473 rows, 569873 distinct ids: 7600 duplicate row(s), the replayed interval inserted again (at-least-once, by design)
+by outcome: block=4 clear=559305 review=10564
+visibility latency per store: the commit timestamp of the row's transaction minus the operator's emission time, in ms (checkpoints every 1000 ms)
+   decisions         p50   1019 ms   p95   2216 ms   max   3004 ms
+   decisions_fast    p50     17 ms   p95     82 ms   max    280 ms
+   decisions_append  p50     17 ms   p95     83 ms   max    208 ms
+OK: one decision per authorisation in the two-phase-commit table, and the keyed table holds the same decisions, row for row.
+```
+
+The two-phase table holds one row per authorisation and nothing else. The
+keyed table converged to the same rows, value for value, which is the part
+that needs saying: the replayed interval rewrote rows a reader may already have
+seen, and it rewrote them to the same decisions because the operator's state
+was restored to the checkpoint and the input replayed in order. The append
+table kept the replay: 7,600 rows inserted twice. The latency column is the
+price of the first table: its rows wait for the checkpoint, about a second at
+the median with a one-second interval, and the other two do not.
+
+Which table a consumer reads is a question about what it does with a row.
+Something that acts once per row, opening a case or holding a card, reads the
+two-phase table or dedupes by id itself. Something that wants the latest
+decision per authorisation can read the keyed table and its tens of
+milliseconds, on two conditions the scene makes visible. The decision must be
+reproducible from state and input, because the replay rewrites visible rows;
+the operator declares its one wall-clock field (`decided_at`) to the engine,
+whose analyser then warns that output is not reproducible across a replay, and
+the gate compares the tables on every other column. And anything that follows
+the keyed table's changes sees each replayed row change again, so it must be
+idempotent by id too. The latency also says where this path belongs. A
+decision that must stop an authorisation before it completes is on the request
+path, in milliseconds; what a stream decides is post-authorisation, a hold or a
+step-up a few hundred milliseconds or a second later.
+
+`DECISION_TIERS=2pc DIAG=0 cluster/run-rail.sh` keeps only the transactional
+stores, so every sink in the job is exactly-once: the Postgres and Kafka alert
+sinks, the two-phase decision table, and the exactly-once file sink for the OTP
+detector's healthy branch. The coordinator then labels the whole job
+end-to-end exactly-once, and an ops console reading its API shows the verdict
+beside what it rests on:
+
+![The rail job's recovery and delivery-guarantee card in the clink console](docs/screenshots/console-rail-job-guarantee.png)
+
+The analyser's verdict is end-to-end exactly-once, and it says what that rests
+on (a replayable Kafka source, checkpointing, a durable state backend, twelve
+two-phase sinks) and what it does not cover: the decision operator declares
+its wall-clock field, so a replay can produce different output even though
+each record is committed once, and twelve transactional sinks commit together
+but not atomically. The same job's sources and sinks, each with the delivery
+its capability record declares:
+
+![The rail job's sources and sinks in the clink console](docs/screenshots/console-rail-job-sinks.png)
+
+The console is [clink-fe](https://github.com/orhaugh/clink-fe), pointed at the
+scene's coordinator (`VITE_CLINK_TARGET=http://127.0.0.1:8081 npm run dev`)
+while `KEEP_UP=1` keeps the cluster running.
+
 ## Idempotency is not exactly-once
 
 The producer re-sends a batch; every record in it is on the topic twice
@@ -271,7 +359,7 @@ ids by the time it is re-sent, so the oracle fails the same way. The scene
 runs with a 30-day TTL because that is the horizon this producer has.
 
 ```
-== submitting: kafka source, idempotency guard OFF, postgres 2PC + kafka 2PC sinks, checkpoints every 1000 ms
+== submitting: kafka source, idempotency guard OFF, postgres 2PC + kafka 2PC alert sinks, decisions to postgres 2PC + upsert + append, diagnostics files on, checkpoints every 1000 ms
 ...
 == gate 1: the case table against the manifest (exactly-once into postgres)
 alerts: 11 written, 9 expected
@@ -283,7 +371,11 @@ FAIL (4):
 == gate 2: the alerts topic, read_committed, against the manifest (exactly-once into kafka)
 alerts: 11 written, 9 expected
 FAIL (4): (the same four)
-alerts topic: 11 records on the log, 11 visible to a read_committed consumer
+alerts topic: 12 records on the log, 11 visible to a read_committed consumer
+== gate 3: the decision stores, one decision per authorisation across three delivery tiers
+decisions, two-phase commit:  605526 rows, 569873 distinct ids
+without the guard the re-sent batch was decided twice: the two-phase-commit table shows the input's duplication
+   (35653 extra rows); a keyed store collapses it to one row per id and hides it.
 == verdict
 OK (negative control): without the idempotency guard the retried batch reached the detectors
     twice and the oracle failed, as it must. Exactly-once delivery did not, and cannot, dedupe the input.
@@ -291,7 +383,11 @@ OK (negative control): without the idempotency guard the retried batch reached t
 
 The two stores still agree with each other to the row: the engine
 delivered every detector emission exactly once. The duplication is in the
-input, and only the domain's idempotency key can see it.
+input, and only the domain's idempotency key can see it. The decision tables
+make the same point from the other side: the two-phase table holds the 35,653
+authorisations of the re-sent batch twice, exactly once each time, and the
+keyed table, upserting by id, shows one row for each and hides that anything
+happened.
 
 ## The run, checked against the protocol's specification
 
@@ -331,7 +427,7 @@ formal-check:   DIVERGES after 1s at event 54: {"seq":30,"ts":1792685352395602,"
 formal-check:   no step of the specification produces this event from any state the trace reached
 ```
 
-The checker stops at the first commit a sink declined, and that is the
+The checker stopped at the first commit a sink declined, and that was the
 honest result against clink v0.11.0's specification: it modelled every
 prepare as staging a transaction, and this feed is nine alerts in ninety
 days, so in most intervals a sink receives nothing, stages nothing and
@@ -339,21 +435,41 @@ declines the commit with nothing to do. clink's own traced workloads carry
 records in every interval and never produced that step; a fraud feed
 produces it every second. Which is what a specification is for: when the
 run and the model disagree, one of them is wrong, and the checker names the
-exact step to look at. The specification was then extended on clink main
-(an empty prepare that stages nothing, a ghost fixing a position's answer
-across a replay, invariants that ask nothing of a sink at an interval it
-found empty), and against that checker the same kind of run is accepted:
+exact step to look at. The specification was then extended (an empty
+prepare that stages nothing, a ghost fixing a position's answer across a
+replay, invariants that ask nothing of a sink at an interval it found
+empty), released in clink v0.12.0, the version this repository pins, and
+against it the run is accepted. With the decision stream beside the alerts,
+the traced run now carries a dense two-phase table next to the sparse case
+table, a worker killed mid-batch and a restart, and is accepted all the same:
 
 ```
-formal-check: TLC trace/rail-trace (4281 events)
-formal-check:   accepted in 9s: every event is a step the specification allows
+trace: 4811 protocol events from 3 process files
+   SubtaskAck x1967
+   SinkConfirm x1275
+   SinkPrepare x512
+   DeliverCommit x510
+   Trigger x90
+   DeliverBarrier x90
+   WriteCompleted x85
+   CoordComplete x85
+   Broadcast x85
+   Placement x46
+   SinkCommit x39
+   SubtaskDrained x12
+   SinkOpens x12
+   WorkerDies x1
+   RestartOnError x1
+   Redeploy x1
+formal-check: TLC trace/trace (4811 events)
+formal-check:   accepted in 16s: every event is a step the specification allows
+validate-trace: the recorded run is a behaviour of the exactly-once specification
 ```
 
-That run (455 prepares, 9 of them staged, a worker lost and the job
-redeployed) is now one of the recorded traces clink validates on every
-push. `CLINK_SPEC_SOURCE=/path/to/clink cluster/validate-trace.sh
-cluster/trace` runs the check with a checkout newer than the pinned
-release; the pin follows the next release.
+The first accepted run of this scene (4,281 events, 455 prepares, 9 of them
+staged) is one of the recorded traces clink validates on every push.
+`cluster/validate-trace.sh` takes the specification from the pinned release;
+`CLINK_SPEC_SOURCE=/path/to/clink` points it at a newer checkout.
 
 ## Kill the detector, the case table doesn't lie
 
@@ -399,8 +515,9 @@ Three independent gates, all run by `scripts/run-detections.sh`:
 1. **Harness tests** (`app/tests/patterns_test.cpp`): each detector driven
    through clink's public testing framework with explicit event times and
    watermarks - match, non-match, negation, timeout and skip behaviour
-   pinned per pattern, plus a codec round-trip and the idempotency guard's
-   drop-and-expire contract.
+   pinned per pattern, plus a codec round-trip, the idempotency guard's
+   drop-and-expire contract, and the decision operator's outcomes, decline
+   window and restore.
 2. **The oracle** (`tools/check.py`): the tape run's alerts against the
    manifest - exact multiset equality on the expected alerts, silence from
    every negative control, and zero alerts anywhere else.
@@ -408,6 +525,9 @@ Three independent gates, all run by `scripts/run-detections.sh`:
 
 The cluster scenes reuse the same oracle over what they read back from the
 stores: the case table rendered as JSON rows, the alerts topic as consumed.
+The rail scene's decision gate counts against the tape itself: one
+two-phase row per authorisation in the feed, the keyed table equal to it on
+every column but the wall-clock one.
 
 ## Layout
 
@@ -417,17 +537,21 @@ scripts/run-detections.sh       generate -> build -> test -> detect -> verify
 scripts/scene-risk-lookup.sh    queryable-state scene: served profiles vs the tape
 cluster/run.sh                  cluster scene: in-image plugin build -> submit -> gate
 cluster/run-rail.sh             payment rail: kafka in, postgres + kafka 2PC out, worker kill;
-                                GUARD=0 negative control, TRACE=1 specification check
+                                one decision per authorisation into 2PC / upsert / append tables;
+                                GUARD=0 negative control, TRACE=1 specification check,
+                                DECISION_TIERS=2pc DIAG=0 for an end-to-end exactly-once job
 cluster/validate-trace.sh       a recorded run against clink's exactly-once specification
 cluster/run-2pc.sh              bounded tape, Postgres 2PC + kill-a-worker; NO_KILL / NO_PG switches
 cluster/replay.sh               capture -> replay --verify -> --emit-test bundle
 cluster/docker-compose.yml      coordinator + two workers + postgres (+ kafka under the rail profile)
 docs/exactly-once-in-practice.md  the guarantees, stage by stage, and where they stop
+docs/screenshots/               the rail job in the clink console
 tools/csgen.py                  deterministic tape + rules + manifest generator
 tools/railfeed.py               the tape as producer batches, one of them re-sent
 tools/check.py                  the oracle (--only-patterns for subset deployments)
 app/src/events.hpp              event model, parser, codecs, haversine, alerts
 app/src/idempotency.hpp         the idempotency guard (keyed seen-set, event-time TTL)
+app/src/decision.hpp            the decision operator: one decision per authorisation
 app/src/patterns.hpp            shared pattern builders + alert selectors
 app/src/rules.hpp               effective-dated rule model + codec
 app/src/watchlist.hpp           broadcast-state watchlist detector
@@ -435,14 +559,14 @@ app/src/risk_profile.hpp        per-card profile + queryable-state binding
 app/src/risk_profile_v2.hpp     the evolved profile (v2) + the v1->v2 migration
 app/src/card_sentry.cpp         the embedded pipeline
 app/src/card_sentry_job.cpp     the same detectors as a job plugin (.so); file or kafka source
-app/tests/patterns_test.cpp     harness tests per detector + the guard
+app/tests/patterns_test.cpp     harness tests per detector, the guard and the decision operator
 app/tests/schema_evolution_test.cpp   migration + pre-deploy compatibility gate
 ```
 
 ## Pinning
 
 `scripts/get-clink.sh` installs into `.clink/prefix`; nothing touches
-system paths. Release mode installs a pinned tag (currently v0.11.0) and
+system paths. Release mode installs a pinned tag (currently v0.12.0) and
 `CLINK_SOURCE=/path/to/clink` installs a local working tree
 into the identical layout - the consumption seam (installed package + CLI)
 is the same in both modes, so flipping between them changes nothing in
