@@ -23,7 +23,7 @@
 # fetches just those two directories at the pinned tag. CLINK_SPEC_SOURCE
 # names another clink checkout to take the specification from, for a model
 # newer than the pinned release's. The empty-interval extension this scene
-# prompted is in the specification from clink v0.12.0, the pinned release.
+# prompted is in the specification from clink v0.12.0 on.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

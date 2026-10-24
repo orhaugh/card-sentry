@@ -47,7 +47,7 @@ any project would.
 
 How the guarantees fit together, stage by stage and with their limits, is
 written up in [docs/exactly-once-in-practice.md](docs/exactly-once-in-practice.md).
-The repository pins clink v0.12.0; `scripts/get-clink.sh` installs it, and
+The repository pins clink v0.12.1; `scripts/get-clink.sh` installs it, and
 the cluster scenes pull the matching published runtime image.
 
 ## Quick start
@@ -435,13 +435,13 @@ declines the commit with nothing to do. clink's own traced workloads carry
 records in every interval and never produced that step; a fraud feed
 produces it every second. Which is what a specification is for: when the
 run and the model disagree, one of them is wrong, and the checker names the
-exact step to look at. The specification was then extended (an empty
-prepare that stages nothing, a ghost fixing a position's answer across a
-replay, invariants that ask nothing of a sink at an interval it found
-empty), released in clink v0.12.0, the version this repository pins, and
-against it the run is accepted. With the decision stream beside the alerts,
-the traced run now carries a dense two-phase table next to the sparse case
-table, a worker killed mid-batch and a restart, and is accepted all the same:
+exact step to look at. The specification was then extended (an empty prepare
+that stages nothing, a ghost fixing a position's answer across a replay,
+invariants that ask nothing of a sink at an interval it found empty),
+released in clink v0.12.0, and against it the run is accepted. With the
+decision stream beside the alerts, the traced run now carries a dense
+two-phase table next to the sparse case table, a worker killed mid-batch and
+a restart, and is accepted all the same:
 
 ```
 trace: 4811 protocol events from 3 process files
@@ -566,7 +566,7 @@ app/tests/schema_evolution_test.cpp   migration + pre-deploy compatibility gate
 ## Pinning
 
 `scripts/get-clink.sh` installs into `.clink/prefix`; nothing touches
-system paths. Release mode installs a pinned tag (currently v0.12.0) and
+system paths. Release mode installs a pinned tag (currently v0.12.1) and
 `CLINK_SOURCE=/path/to/clink` installs a local working tree
 into the identical layout - the consumption seam (installed package + CLI)
 is the same in both modes, so flipping between them changes nothing in

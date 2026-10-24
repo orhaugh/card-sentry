@@ -267,7 +267,7 @@ the graph and is switched off by a parameter.
   step the checker could not explain. clink's own traced workloads never
   produce that step; a feed with nine alerts in ninety days produces it in
   almost every interval. The specification was extended for it, released
-  in clink v0.12.0, which this repository pins: the same run is accepted by
+  in clink v0.12.0: the same run is accepted by
   the extended model (4,281 events, every one a step the protocol allows)
   and recorded among the traces clink validates on every push, and the
   denser run with the decision stream beside it (4,811 events, a worker

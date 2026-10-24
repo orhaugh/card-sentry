@@ -519,9 +519,9 @@ if [[ "${TRACE}" == "1" ]]; then
     # v0.11.0's specification modelled every prepare as staging a
     # transaction, so a sink that received nothing in an interval (most
     # intervals, for a feed with nine alerts in ninety days) and declined its
-    # commit was the first step its checker could not explain. From v0.12.0,
-    # the pinned release, the specification has that step and accepts the
-    # run; a checker that still stops names the event it cannot explain.
+    # commit was the first step its checker could not explain. From v0.12.0
+    # on, the specification has that step and accepts the run; a checker
+    # that still stops names the event it cannot explain.
     set +e
     cluster/validate-trace.sh cluster/trace
     TRACE_RC=$?

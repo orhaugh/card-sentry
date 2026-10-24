@@ -30,7 +30,7 @@ x-clink-env: &clink-env
 
 services:
   coordinator:
-    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.0}
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.1}
     # The image's entrypoint runs clink_node for a flag-first command (and
     # the `clink` CLI for a subcommand), so the daemon's flags come bare.
     command:
@@ -105,7 +105,7 @@ services:
       start_period: 10s
 
   worker1:
-    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.0}
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.1}
     command:
       - --role=worker
       - --id=worker-1
@@ -126,7 +126,7 @@ services:
     restart: on-failure
 
   worker2:
-    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.0}
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.12.1}
     command:
       - --role=worker
       - --id=worker-2
