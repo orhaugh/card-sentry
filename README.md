@@ -47,7 +47,7 @@ any project would.
 
 How the guarantees fit together, stage by stage and with their limits, is
 written up in [docs/exactly-once-in-practice.md](docs/exactly-once-in-practice.md).
-The repository pins clink v0.12.1; `scripts/get-clink.sh` installs it, and
+The repository pins clink v0.13.0; `scripts/get-clink.sh` installs it, and
 the cluster scenes pull the matching published runtime image.
 
 ## Quick start
@@ -566,7 +566,7 @@ app/tests/schema_evolution_test.cpp   migration + pre-deploy compatibility gate
 ## Pinning
 
 `scripts/get-clink.sh` installs into `.clink/prefix`; nothing touches
-system paths. Release mode installs a pinned tag (currently v0.12.1) and
+system paths. Release mode installs a pinned tag (currently v0.13.0) and
 `CLINK_SOURCE=/path/to/clink` installs a local working tree
 into the identical layout - the consumption seam (installed package + CLI)
 is the same in both modes, so flipping between them changes nothing in
