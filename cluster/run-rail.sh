@@ -456,7 +456,7 @@ fi
 say "the diagnostics side"
 diag_lines="$(cat out-cluster/alerts-*.ndjson 2>/dev/null | grep -c . || true)"
 echo "file sinks: ${diag_lines} alert lines; case table: $(case_rows) rows. The files are at-least-once"
-echo "   diagnostics a restore may truncate or duplicate; they are not part of the contract."
+echo "   diagnostics a restore may duplicate; they are not part of the contract."
 if [[ "${GUARD_DEBUG:-0}" == "1" ]]; then
     echo "the guard, from the worker logs (open = what the restored seen-set held):"
     ${COMPOSE} logs --no-color 2>&1 | grep -h "cs.guard\] open" | sed 's/^/   /' | cut -c1-200 || true
