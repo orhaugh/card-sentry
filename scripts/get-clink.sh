@@ -6,7 +6,7 @@
 # and CLI. Everything lands under .clink/ inside this repository; nothing is
 # written to system paths.
 #
-# Two modes:
+# Three modes:
 #
 #   Release (default)   clone the pinned tag, build, install. This is the
 #                       mode the published repository ships with.
@@ -20,9 +20,16 @@
 #                       records the source commit (and a -dirty marker), and
 #                       a dirty tree always reinstalls.
 #
+#   SDK                 CLINK_SDK=/path/to/clink-<version>-linux-x86_64-ubuntu24.04.tar.gz
+#                       installs a prebuilt SDK tarball: a release's asset,
+#                       or the one a clink release-binaries dry run uploads.
+#                       CI uses it to run this project against a clink
+#                       release candidate before it is tagged.
+#
 #   CLINK_VERSION      release tag to pin (default: the version this repo ships against)
 #   CLINK_REPO         git URL (default: https://github.com/orhaugh/clink)
 #   CLINK_SOURCE      path to a local clink checkout; overrides the tag path
+#   CLINK_SDK          path to an SDK tarball; overrides both of the above
 #   CLINK_JOBS         build parallelism (default: number of CPUs, capped at 10)
 #   CLINK_SKIP_ICEBERG set to 1 to skip the iceberg-cpp toolchain build and the
 #                      Iceberg impl. Required when the pinned Arrow is built
@@ -80,6 +87,40 @@ configure_build_install() {
     echo "   CMake package:  ${PREFIX}/lib/cmake/clink (use -DCMAKE_PREFIX_PATH=${PREFIX})"
 }
 
+install_sdk() {
+    # $1 = SDK tarball, $2 = stamp contents. Verifies the tarball against the
+    # .sha256 beside it when there is one, then unpacks it as the prefix.
+    local tarball="$1" stamp="$2"
+    local dir name tmp
+    dir="$(cd "$(dirname "${tarball}")" && pwd)"
+    name="$(basename "${tarball}")"
+    if [[ -f "${dir}/${name}.sha256" ]]; then
+        ( cd "${dir}" && sha256sum -c "${name}.sha256" >/dev/null )
+    fi
+    tmp="$(mktemp -d)"
+    tar xzf "${tarball}" -C "${tmp}"
+    mkdir -p "${ROOT}/.clink"
+    rm -rf "${PREFIX}"
+    mv "${tmp}/${name%.tar.gz}" "${PREFIX}"
+    rm -rf "${tmp}"
+    echo "${stamp}" > "${STAMP}"
+    echo "== clink ${stamp} installed from the prebuilt SDK."
+    echo "   CLI:            ${PREFIX}/bin/clink"
+    echo "   CMake package:  ${PREFIX}/lib/cmake/clink (use -DCMAKE_PREFIX_PATH=${PREFIX})"
+}
+
+# ---- SDK mode ---------------------------------------------------------------
+if [[ -n "${CLINK_SDK:-}" ]]; then
+    want="sdk:$(basename "${CLINK_SDK}" .tar.gz)"
+    if [[ -x "${PREFIX}/bin/clink" && -f "${STAMP}" ]] && grep -qx "${want}" "${STAMP}"; then
+        echo "clink ${want} already installed at ${PREFIX}"
+        exit 0
+    fi
+    echo "== card-sentry: installing clink from ${CLINK_SDK}"
+    install_sdk "${CLINK_SDK}" "${want}"
+    exit 0
+fi
+
 # ---- Local-source mode ------------------------------------------------------
 if [[ -n "${CLINK_SOURCE:-}" ]]; then
     SRC_DIR="$(cd "${CLINK_SOURCE}" && pwd)"
@@ -126,16 +167,8 @@ if [[ "${CLINK_FROM_SOURCE:-0}" != "1" && "$(uname -s)" == "Linux" && "$(uname -
     echo "-- trying the prebuilt SDK: ${base}/${asset}"
     if curl -fsSL -o "${tmp}/${asset}" "${base}/${asset}" \
        && curl -fsSL -o "${tmp}/${asset}.sha256" "${base}/${asset}.sha256"; then
-        ( cd "${tmp}" && sha256sum -c "${asset}.sha256" >/dev/null )
-        mkdir -p "${ROOT}/.clink"
-        rm -rf "${PREFIX}"
-        tar xzf "${tmp}/${asset}" -C "${tmp}"
-        mv "${tmp}/${asset%.tar.gz}" "${PREFIX}"
+        install_sdk "${tmp}/${asset}" "${CLINK_VERSION}"
         rm -rf "${tmp}"
-        echo "${CLINK_VERSION}" > "${STAMP}"
-        echo "== clink ${CLINK_VERSION} installed from the prebuilt SDK."
-        echo "   CLI:            ${PREFIX}/bin/clink"
-        echo "   CMake package:  ${PREFIX}/lib/cmake/clink (use -DCMAKE_PREFIX_PATH=${PREFIX})"
         exit 0
     fi
     rm -rf "${tmp}"

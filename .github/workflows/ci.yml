@@ -13,18 +13,33 @@
 #
 # The cluster scenes (cluster/run.sh, run-2pc.sh, run-rail.sh, replay.sh)
 # need Docker and the published runtime image; they run locally, not here.
+#
+# A dispatch can run it against another clink: clink_version names a release
+# tag, clink_sdk_run a clink release-binaries dry run, whose SDK tarball (and
+# commit) is tested instead. clink's scripts/check-showcases.sh dispatches
+# that for a release candidate before it is tagged.
 
 name: ci
+# A dispatched run names the clink it ran against; push and pull request runs
+# keep their usual name.
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('ci on clink {0}', inputs.clink_sdk_run && format('SDK run {0}', inputs.clink_sdk_run) || inputs.clink_version || 'pin') || '' }}"
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      clink_version:
+        description: A clink release tag to run against instead of the pin
+        default: ""
+      clink_sdk_run:
+        description: A clink release-binaries dry run (its run id) whose SDK to run against
+        default: ""
 
 env:
   # The tagged clink release the detectors build against.
-  CLINK_VERSION: v0.15.0
+  CLINK_VERSION: ${{ inputs.clink_version || 'v0.15.0' }}
   # No object-store Arrow (nothing here uses s3://): lets the pinned
   # toolchain build on a bare runner without the aws-sdk at /usr/local.
   CLINK_ARROW_OBJECT_STORES: "OFF"
@@ -54,7 +69,20 @@ jobs:
             libssl-dev libcurl4-openssl-dev libsqlite3-dev libxml2-dev \
             libzstd-dev zlib1g-dev
 
-      - name: Install clink (pinned release)
+      - name: Fetch the clink SDK under test
+        if: inputs.clink_sdk_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.clink_sdk_run }}
+        run: |
+          gh run download "${RUN}" -R orhaugh/clink -n clink-linux-x86_64-ubuntu24.04 -D "${RUNNER_TEMP}/clink-sdk"
+          sdk="$(ls "${RUNNER_TEMP}"/clink-sdk/clink-*.tar.gz)"
+          commit="$(gh api "repos/orhaugh/clink/actions/runs/${RUN}" --jq .head_sha)"
+          echo "CLINK_SDK=${sdk}" >> "${GITHUB_ENV}"
+          echo "CLINK_COMMIT=${commit}" >> "${GITHUB_ENV}"
+          echo "clink under test: $(basename "${sdk}") from run ${RUN}, commit ${commit}" | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install clink (the pin, or the clink under test)
         run: scripts/get-clink.sh
 
       - name: Build the detectors against the installed package
